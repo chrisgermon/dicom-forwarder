@@ -1006,6 +1006,259 @@ async def halopsa_ticket_summary(
         return f"Error: {str(e)}"
 
 
+@mcp.tool(annotations={"readOnlyHint": True})
+async def halopsa_get_recurring_invoices(
+    client_id: Optional[int] = Field(None, description="Filter by client ID"),
+    search: Optional[str] = Field(None, description="Search by name/reference"),
+    active_only: bool = Field(True, description="Only show active recurring invoices"),
+    limit: int = Field(50, description="Max results")
+) -> str:
+    """List HaloPSA recurring invoices."""
+    if not halopsa_config.is_configured:
+        return "Error: HaloPSA not configured."
+    
+    try:
+        token = await halopsa_config.get_access_token()
+        params = {"count": min(limit, 100)}
+        
+        if client_id:
+            params["client_id"] = client_id
+        if search:
+            params["search"] = search
+        if active_only:
+            params["inactive"] = "false"
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{halopsa_config.resource_server}/RecurringInvoice",
+                params=params,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+            response.raise_for_status()
+            recurring = response.json().get("recurring_invoices", [])
+        
+        if not recurring:
+            return "No recurring invoices found."
+        
+        results = []
+        for r in recurring[:limit]:
+            rec_id = r.get('id', 'N/A')
+            client_name = r.get('client_name', 'Unknown')
+            ref = r.get('ref', 'N/A')
+            total = r.get('total', 0)
+            billing = r.get('billing_cycle_name', 'N/A')
+            next_date = r.get('next_invoice_date', '')[:10]
+            active = "Active" if not r.get('inactive', False) else "Inactive"
+            
+            results.append(f"**{ref}** (ID: {rec_id})\n  Client: {client_name} | Total: ${total:,.2f} | Billing: {billing}\n  Next Invoice: {next_date} | Status: {active}")
+        
+        return f"Found {len(results)} recurring invoice(s):\n\n" + "\n\n".join(results)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def halopsa_get_recurring_invoice(recurring_invoice_id: int = Field(..., description="Recurring Invoice ID")) -> str:
+    """Get detailed recurring invoice information including line items."""
+    if not halopsa_config.is_configured:
+        return "Error: HaloPSA not configured."
+    
+    try:
+        token = await halopsa_config.get_access_token()
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{halopsa_config.resource_server}/RecurringInvoice/{recurring_invoice_id}",
+                params={"includedetails": "true", "includelines": "true"},
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+            response.raise_for_status()
+            r = response.json()
+        
+        lines = []
+        for idx, item in enumerate(r.get('lines', []), 1):
+            line_id = item.get('id', 'N/A')
+            desc = item.get('description', 'No description')
+            qty = item.get('count', 1)
+            price = item.get('price', 0)
+            total = item.get('total', qty * price)
+            item_code = item.get('item_code', '')
+            lines.append(f"{idx}. **{desc}** (Line ID: {line_id})\n   Item Code: {item_code} | Qty: {qty} x ${price:,.2f} = ${total:,.2f}")
+        
+        active = "Active" if not r.get('inactive', False) else "Inactive"
+        
+        return f"""# Recurring Invoice: {r.get('ref', 'Unknown')}
+
+**ID:** {r.get('id')}
+**Client:** {r.get('client_name', 'N/A')} (Client ID: {r.get('client_id', 'N/A')})
+**Status:** {active}
+**Billing Cycle:** {r.get('billing_cycle_name', 'N/A')}
+**Next Invoice Date:** {r.get('next_invoice_date', 'N/A')[:10] if r.get('next_invoice_date') else 'N/A'}
+**PO Number:** {r.get('ponumber', 'N/A')}
+
+## Line Items
+{chr(10).join(lines) if lines else 'No line items'}
+
+**Subtotal:** ${r.get('subtotal', 0):,.2f}
+**Tax:** ${r.get('tax', 0):,.2f}
+**Total:** ${r.get('total', 0):,.2f}"""
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def halopsa_add_recurring_invoice_line(
+    recurring_invoice_id: int = Field(..., description="Recurring Invoice ID"),
+    description: str = Field(..., description="Line item description"),
+    quantity: float = Field(1, description="Quantity"),
+    unit_price: float = Field(..., description="Unit price (ex tax)"),
+    item_id: Optional[int] = Field(None, description="HaloPSA Item ID (optional - for linking to catalog item)"),
+    tax_code: str = Field("GST", description="Tax code (default: GST)")
+) -> str:
+    """Add a line item to a recurring invoice."""
+    if not halopsa_config.is_configured:
+        return "Error: HaloPSA not configured."
+    
+    try:
+        token = await halopsa_config.get_access_token()
+        
+        # First get the existing recurring invoice
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{halopsa_config.resource_server}/RecurringInvoice/{recurring_invoice_id}",
+                params={"includedetails": "true", "includelines": "true"},
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+            response.raise_for_status()
+            existing = response.json()
+        
+        # Create new line item
+        new_line = {
+            "description": description,
+            "count": quantity,
+            "price": unit_price,
+            "taxcode": tax_code
+        }
+        if item_id:
+            new_line["item_id"] = item_id
+        
+        # Get existing lines and append new one
+        existing_lines = existing.get('lines', [])
+        existing_lines.append(new_line)
+        
+        # Update the recurring invoice with new lines
+        payload = [{
+            "id": recurring_invoice_id,
+            "lines": existing_lines
+        }]
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(f"{halopsa_config.resource_server}/RecurringInvoice",
+                json=payload,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+            response.raise_for_status()
+        
+        total_value = quantity * unit_price
+        return f"✅ Added line item to recurring invoice #{recurring_invoice_id}:\n- {description}\n- Qty: {quantity} x ${unit_price:,.2f} = ${total_value:,.2f}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def halopsa_update_recurring_invoice_line(
+    recurring_invoice_id: int = Field(..., description="Recurring Invoice ID"),
+    line_id: int = Field(..., description="Line item ID to update"),
+    description: Optional[str] = Field(None, description="New description"),
+    quantity: Optional[float] = Field(None, description="New quantity"),
+    unit_price: Optional[float] = Field(None, description="New unit price")
+) -> str:
+    """Update an existing line item on a recurring invoice."""
+    if not halopsa_config.is_configured:
+        return "Error: HaloPSA not configured."
+    
+    try:
+        token = await halopsa_config.get_access_token()
+        
+        # First get the existing recurring invoice
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{halopsa_config.resource_server}/RecurringInvoice/{recurring_invoice_id}",
+                params={"includedetails": "true", "includelines": "true"},
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+            response.raise_for_status()
+            existing = response.json()
+        
+        # Find and update the line
+        lines = existing.get('lines', [])
+        line_found = False
+        for line in lines:
+            if line.get('id') == line_id:
+                if description is not None:
+                    line['description'] = description
+                if quantity is not None:
+                    line['count'] = quantity
+                if unit_price is not None:
+                    line['price'] = unit_price
+                line_found = True
+                break
+        
+        if not line_found:
+            return f"Error: Line ID {line_id} not found in recurring invoice #{recurring_invoice_id}"
+        
+        # Update the recurring invoice
+        payload = [{
+            "id": recurring_invoice_id,
+            "lines": lines
+        }]
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(f"{halopsa_config.resource_server}/RecurringInvoice",
+                json=payload,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+            response.raise_for_status()
+        
+        return f"✅ Updated line #{line_id} on recurring invoice #{recurring_invoice_id}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True})
+async def halopsa_delete_recurring_invoice_line(
+    recurring_invoice_id: int = Field(..., description="Recurring Invoice ID"),
+    line_id: int = Field(..., description="Line item ID to delete")
+) -> str:
+    """Delete a line item from a recurring invoice."""
+    if not halopsa_config.is_configured:
+        return "Error: HaloPSA not configured."
+    
+    try:
+        token = await halopsa_config.get_access_token()
+        
+        # First get the existing recurring invoice
+        async with httpx.AsyncClient() as client:
+            response = await client.get(f"{halopsa_config.resource_server}/RecurringInvoice/{recurring_invoice_id}",
+                params={"includedetails": "true", "includelines": "true"},
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+            response.raise_for_status()
+            existing = response.json()
+        
+        # Remove the line
+        lines = existing.get('lines', [])
+        original_count = len(lines)
+        lines = [line for line in lines if line.get('id') != line_id]
+        
+        if len(lines) == original_count:
+            return f"Error: Line ID {line_id} not found in recurring invoice #{recurring_invoice_id}"
+        
+        # Update the recurring invoice without the deleted line
+        payload = [{
+            "id": recurring_invoice_id,
+            "lines": lines
+        }]
+        
+        async with httpx.AsyncClient() as client:
+            response = await client.post(f"{halopsa_config.resource_server}/RecurringInvoice",
+                json=payload,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"})
+            response.raise_for_status()
+        
+        return f"✅ Deleted line #{line_id} from recurring invoice #{recurring_invoice_id}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
 # ============================================================================
 # Xero Integration
 # ============================================================================
