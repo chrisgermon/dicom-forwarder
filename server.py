@@ -5791,37 +5791,37 @@ async def maxotel_list_plans() -> str:
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
 async def maxotel_create_customer(
-    # Account credentials
+    # Account credentials (required)
     account_username: str = Field(..., description="Customer username (min 6 alphanumeric characters)"),
     account_password: str = Field(..., description="Customer password (min 6 characters)"),
-    account_cust_id: Optional[str] = Field(None, description="Your customer account reference"),
-    # Contact details
+    # Contact details (required)
     account_first_name: str = Field(..., description="Account holder first name (min 2 chars)"),
     account_last_name: str = Field(..., description="Account holder surname (min 2 chars)"),
     account_email: str = Field(..., description="Account holder email"),
-    account_mobile: Optional[str] = Field(None, description="Mobile number (min 10 digits, required if no phone)"),
-    account_phone: Optional[str] = Field(None, description="Phone number (min 10 digits, required if no mobile)"),
-    # Address
+    # Address (required)
     account_address: str = Field(..., description="Street address (min 7 chars)"),
     account_city: str = Field(..., description="City/suburb (min 2 chars)"),
     account_post_code: str = Field(..., description="Postcode (min 4 chars)"),
     account_state: str = Field(..., description="State: QLD, NSW, ACT, VIC, TAS, SA, WA, NT"),
-    account_timezone: str = Field("Australia/Sydney", description="Timezone (e.g., Australia/Sydney, Australia/Melbourne)"),
-    # IPND Service Location
+    # IPND Service Location (required)
     ipnd_street_number: str = Field(..., description="IPND street number"),
     ipnd_street_name: str = Field(..., description="IPND street name (min 2, max 25 chars)"),
     ipnd_street_type: str = Field(..., description="IPND street type (e.g., St, Ave, Rd)"),
     ipnd_locality: str = Field(..., description="IPND suburb name"),
     ipnd_state: str = Field(..., description="IPND state: QLD, NSW, ACT, VIC, TAS, SA, WA, NT"),
     ipnd_postcode: str = Field(..., description="IPND postcode (4 digits)"),
+    # Plan (required)
+    account_plan_id: str = Field(..., description="Plan ID (from maxotel_list_plans)"),
+    # Optional parameters below
+    account_cust_id: Optional[str] = Field(None, description="Your customer account reference"),
+    account_mobile: Optional[str] = Field(None, description="Mobile number (min 10 digits, required if no phone)"),
+    account_phone: Optional[str] = Field(None, description="Phone number (min 10 digits, required if no mobile)"),
+    account_timezone: str = Field("Australia/Sydney", description="Timezone (e.g., Australia/Sydney, Australia/Melbourne)"),
     ipnd_building_type: str = Field("OFF", description="Building type: APT, FF, FY, MB, OFF, RM, SE, SHE, SHOP, SITE, LU, VL, LLA, WE"),
     ipnd_floor_type: str = Field("L", description="Floor type: BF, L, LG, LM, UG"),
-    # Plan & Billing
-    account_plan_id: str = Field(..., description="Plan ID (from maxotel_list_plans)"),
     account_plan_prorated: bool = Field(True, description="Charge prorated plan fee"),
     account_postpaid: bool = Field(False, description="True for postpaid, False for prepaid"),
     account_credit_limit: float = Field(0.0, description="Account spend limit"),
-    # Flags
     strict: bool = Field(True, description="When true, soft fails prevent processing"),
     confirm: bool = Field(True, description="Activate account immediately")
 ) -> str:
