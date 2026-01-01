@@ -1,0 +1,17 @@
+[project]
+name = "crowdit-mcp-server"
+version = "2.0.0"
+description = "Crowd IT Unified MCP Server - HaloPSA, Xero, Front, and SharePoint integration"
+requires-python = ">=3.11"
+dependencies = [
+    "fastmcp>=2.0.0",
+    "httpx>=0.27.0",
+    "pydantic>=2.0.0",
+    "uvicorn>=0.30.0",
+    "starlette>=0.38.0",
+    "google-cloud-secret-manager>=2.20.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
