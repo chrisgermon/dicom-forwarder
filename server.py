@@ -1776,6 +1776,1360 @@ echo -n "{tenant_id}" | gcloud secrets versions add XERO_TENANT_ID --data-file=-
 
 
 # ============================================================================
+# Xero Extended Functions - Bills, Payments, Credit Notes
+# ============================================================================
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def xero_update_invoice_lines(
+    invoice_id: str = Field(..., description="Invoice ID (GUID) - must be DRAFT status"),
+    line_items: str = Field(..., description='JSON array of line items: [{"description": "...", "quantity": 1, "unit_amount": 100.00, "account_code": "200"}]')
+) -> str:
+    """Replace all line items on a DRAFT invoice. Only works on DRAFT invoices."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+        items = json.loads(line_items)
+
+        update_data = {
+            "InvoiceID": invoice_id,
+            "LineItems": [
+                {
+                    "Description": item.get("description", ""),
+                    "Quantity": item.get("quantity", 1),
+                    "UnitAmount": item.get("unit_amount", 0),
+                    "AccountCode": item.get("account_code", "200")
+                }
+                for item in items
+            ]
+        }
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.xero.com/api.xro/2.0/Invoices",
+                json={"Invoices": [update_data]},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json",
+                    "Content-Type": "application/json"
+                }
+            )
+            response.raise_for_status()
+            updated = response.json().get("Invoices", [{}])[0]
+
+        return f"✅ Invoice **{updated.get('InvoiceNumber', invoice_id)}** line items updated. New total: ${updated.get('Total', 0):,.2f}"
+    except json.JSONDecodeError:
+        return "Error: Invalid JSON in line_items."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def xero_get_bills(
+    status: Optional[str] = Field(None, description="Filter: 'DRAFT', 'SUBMITTED', 'AUTHORISED', 'PAID'"),
+    contact_name: Optional[str] = Field(None, description="Filter by supplier name"),
+    days: int = Field(90, description="Bills from last N days"),
+    limit: int = Field(20, description="Max results")
+) -> str:
+    """Get supplier bills (accounts payable invoices)."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+
+        where_parts = ['Type=="ACCPAY"']
+        if status:
+            where_parts.append(f'Status=="{status.upper()}"')
+
+        since_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        where_parts.append(f'Date>=DateTime({since_date.replace("-", ",")})')
+
+        params = {"where": " AND ".join(where_parts), "order": "Date DESC"}
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.xero.com/api.xro/2.0/Invoices",
+                params=params,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json"
+                }
+            )
+            response.raise_for_status()
+            bills = response.json().get("Invoices", [])
+
+        if contact_name:
+            bills = [b for b in bills if contact_name.lower() in b.get("Contact", {}).get("Name", "").lower()]
+
+        bills = bills[:limit]
+
+        if not bills:
+            return "No bills found."
+
+        results = []
+        for bill in bills:
+            contact = bill.get("Contact", {}).get("Name", "Unknown")
+            inv_num = bill.get("InvoiceNumber", "N/A")
+            status_val = bill.get("Status", "N/A")
+            total = bill.get("Total", 0)
+            due = bill.get("AmountDue", 0)
+            date_str = bill.get("DateString", "")[:10]
+
+            results.append(f"**{inv_num}** - {contact}\n  Status: {status_val} | Total: ${total:,.2f} | Due: ${due:,.2f} | Date: {date_str}")
+
+        return f"Found {len(results)} bill(s):\n\n" + "\n\n".join(results)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def xero_create_bill(
+    contact_name: str = Field(..., description="Supplier name (must exist in Xero)"),
+    line_items: str = Field(..., description='JSON array: [{"description": "...", "quantity": 1, "unit_amount": 100.00, "account_code": "400"}]'),
+    invoice_number: Optional[str] = Field(None, description="Supplier's invoice number"),
+    due_days: int = Field(30, description="Days until due"),
+    status: str = Field("DRAFT", description="Status: 'DRAFT' or 'AUTHORISED'")
+) -> str:
+    """Create a supplier bill (accounts payable)."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+        items = json.loads(line_items)
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.xero.com/api.xro/2.0/Contacts",
+                params={"where": f'Name.Contains("{contact_name}")'},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json"
+                }
+            )
+            response.raise_for_status()
+            contacts = response.json().get("Contacts", [])
+
+        if not contacts:
+            return f"Error: Supplier '{contact_name}' not found."
+
+        bill_data = {
+            "Type": "ACCPAY",
+            "Contact": {"ContactID": contacts[0]["ContactID"]},
+            "Date": datetime.now().strftime("%Y-%m-%d"),
+            "DueDate": (datetime.now() + timedelta(days=due_days)).strftime("%Y-%m-%d"),
+            "LineItems": [
+                {
+                    "Description": item.get("description", ""),
+                    "Quantity": item.get("quantity", 1),
+                    "UnitAmount": item.get("unit_amount", 0),
+                    "AccountCode": item.get("account_code", "400")
+                }
+                for item in items
+            ],
+            "Status": status.upper()
+        }
+
+        if invoice_number:
+            bill_data["InvoiceNumber"] = invoice_number
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.xero.com/api.xro/2.0/Invoices",
+                json={"Invoices": [bill_data]},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json",
+                    "Content-Type": "application/json"
+                }
+            )
+            response.raise_for_status()
+            created = response.json().get("Invoices", [{}])[0]
+
+        return f"✅ Bill created: **{created.get('InvoiceNumber', 'N/A')}** for ${created.get('Total', 0):,.2f}"
+    except json.JSONDecodeError:
+        return "Error: Invalid JSON in line_items."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def xero_get_payments(
+    invoice_id: Optional[str] = Field(None, description="Filter by invoice ID"),
+    days: int = Field(90, description="Payments from last N days"),
+    limit: int = Field(50, description="Max results")
+) -> str:
+    """Get payment records."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+
+        since_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        params = {
+            "where": f'Date>=DateTime({since_date.replace("-", ",")})',
+            "order": "Date DESC"
+        }
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.xero.com/api.xro/2.0/Payments",
+                params=params,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json"
+                }
+            )
+            response.raise_for_status()
+            payments = response.json().get("Payments", [])
+
+        if invoice_id:
+            payments = [p for p in payments if p.get("Invoice", {}).get("InvoiceID") == invoice_id]
+
+        payments = payments[:limit]
+
+        if not payments:
+            return "No payments found."
+
+        results = []
+        for p in payments:
+            inv = p.get("Invoice", {})
+            inv_num = inv.get("InvoiceNumber", "N/A")
+            contact = inv.get("Contact", {}).get("Name", "Unknown")
+            amount = p.get("Amount", 0)
+            date_str = p.get("Date", "")[:10]
+            status_val = p.get("Status", "N/A")
+            payment_type = p.get("PaymentType", "N/A")
+
+            results.append(f"**${amount:,.2f}** - {inv_num} ({contact})\n  Date: {date_str} | Type: {payment_type} | Status: {status_val}")
+
+        return f"Found {len(results)} payment(s):\n\n" + "\n\n".join(results)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def xero_create_payment(
+    invoice_id: str = Field(..., description="Invoice ID (GUID) to pay"),
+    amount: float = Field(..., description="Payment amount"),
+    account_code: str = Field(..., description="Bank account code (e.g., '090' for checking)"),
+    date: Optional[str] = Field(None, description="Payment date (YYYY-MM-DD), defaults to today"),
+    reference: Optional[str] = Field(None, description="Payment reference")
+) -> str:
+    """Record a payment against an invoice."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+
+        # Get the account ID for the bank account
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.xero.com/api.xro/2.0/Accounts",
+                params={"where": f'Code=="{account_code}"'},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json"
+                }
+            )
+            response.raise_for_status()
+            accounts = response.json().get("Accounts", [])
+
+        if not accounts:
+            return f"Error: Account with code '{account_code}' not found."
+
+        payment_data = {
+            "Invoice": {"InvoiceID": invoice_id},
+            "Account": {"AccountID": accounts[0]["AccountID"]},
+            "Amount": amount,
+            "Date": date or datetime.now().strftime("%Y-%m-%d")
+        }
+
+        if reference:
+            payment_data["Reference"] = reference
+
+        async with httpx.AsyncClient() as client:
+            response = await client.put(
+                "https://api.xero.com/api.xro/2.0/Payments",
+                json={"Payments": [payment_data]},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json",
+                    "Content-Type": "application/json"
+                }
+            )
+            response.raise_for_status()
+            created = response.json().get("Payments", [{}])[0]
+
+        return f"✅ Payment of ${amount:,.2f} recorded against invoice."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def xero_get_credit_notes(
+    status: Optional[str] = Field(None, description="Filter: 'DRAFT', 'SUBMITTED', 'AUTHORISED', 'PAID'"),
+    contact_name: Optional[str] = Field(None, description="Filter by contact name"),
+    limit: int = Field(20, description="Max results")
+) -> str:
+    """Get credit notes."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+
+        params = {"order": "Date DESC"}
+        if status:
+            params["where"] = f'Status=="{status.upper()}"'
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.xero.com/api.xro/2.0/CreditNotes",
+                params=params,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json"
+                }
+            )
+            response.raise_for_status()
+            credit_notes = response.json().get("CreditNotes", [])
+
+        if contact_name:
+            credit_notes = [cn for cn in credit_notes if contact_name.lower() in cn.get("Contact", {}).get("Name", "").lower()]
+
+        credit_notes = credit_notes[:limit]
+
+        if not credit_notes:
+            return "No credit notes found."
+
+        results = []
+        for cn in credit_notes:
+            contact = cn.get("Contact", {}).get("Name", "Unknown")
+            cn_num = cn.get("CreditNoteNumber", "N/A")
+            status_val = cn.get("Status", "N/A")
+            total = cn.get("Total", 0)
+            remaining = cn.get("RemainingCredit", 0)
+            date_str = cn.get("DateString", "")[:10]
+            cn_type = cn.get("Type", "N/A")
+
+            results.append(f"**{cn_num}** - {contact} ({cn_type})\n  Status: {status_val} | Total: ${total:,.2f} | Remaining: ${remaining:,.2f} | Date: {date_str}")
+
+        return f"Found {len(results)} credit note(s):\n\n" + "\n\n".join(results)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def xero_create_credit_note(
+    contact_name: str = Field(..., description="Contact name"),
+    line_items: str = Field(..., description='JSON array: [{"description": "...", "quantity": 1, "unit_amount": 100.00, "account_code": "200"}]'),
+    credit_note_type: str = Field("ACCRECCREDIT", description="Type: 'ACCRECCREDIT' (customer) or 'ACCPAYCREDIT' (supplier)"),
+    reference: Optional[str] = Field(None, description="Credit note reference"),
+    status: str = Field("DRAFT", description="Status: 'DRAFT' or 'AUTHORISED'")
+) -> str:
+    """Create a credit note."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+        items = json.loads(line_items)
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.xero.com/api.xro/2.0/Contacts",
+                params={"where": f'Name.Contains("{contact_name}")'},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json"
+                }
+            )
+            response.raise_for_status()
+            contacts = response.json().get("Contacts", [])
+
+        if not contacts:
+            return f"Error: Contact '{contact_name}' not found."
+
+        cn_data = {
+            "Type": credit_note_type.upper(),
+            "Contact": {"ContactID": contacts[0]["ContactID"]},
+            "Date": datetime.now().strftime("%Y-%m-%d"),
+            "LineItems": [
+                {
+                    "Description": item.get("description", ""),
+                    "Quantity": item.get("quantity", 1),
+                    "UnitAmount": item.get("unit_amount", 0),
+                    "AccountCode": item.get("account_code", "200")
+                }
+                for item in items
+            ],
+            "Status": status.upper()
+        }
+
+        if reference:
+            cn_data["Reference"] = reference
+
+        async with httpx.AsyncClient() as client:
+            response = await client.put(
+                "https://api.xero.com/api.xro/2.0/CreditNotes",
+                json={"CreditNotes": [cn_data]},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json",
+                    "Content-Type": "application/json"
+                }
+            )
+            response.raise_for_status()
+            created = response.json().get("CreditNotes", [{}])[0]
+
+        return f"✅ Credit note created: **{created.get('CreditNoteNumber', 'N/A')}** for ${created.get('Total', 0):,.2f}"
+    except json.JSONDecodeError:
+        return "Error: Invalid JSON in line_items."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def xero_void_invoice(
+    invoice_id: str = Field(..., description="Invoice ID (GUID) to void")
+) -> str:
+    """Void an invoice. Only works on AUTHORISED invoices with no payments."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.xero.com/api.xro/2.0/Invoices",
+                json={"Invoices": [{"InvoiceID": invoice_id, "Status": "VOIDED"}]},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json",
+                    "Content-Type": "application/json"
+                }
+            )
+            response.raise_for_status()
+            updated = response.json().get("Invoices", [{}])[0]
+
+        return f"✅ Invoice **{updated.get('InvoiceNumber', invoice_id)}** has been voided."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def xero_email_invoice(
+    invoice_id: str = Field(..., description="Invoice ID (GUID) to email")
+) -> str:
+    """Email an invoice to the contact. Invoice must be AUTHORISED."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"https://api.xero.com/api.xro/2.0/Invoices/{invoice_id}/Email",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json"
+                }
+            )
+            response.raise_for_status()
+
+        return f"✅ Invoice emailed successfully."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+# ============================================================================
+# Xero Extended Functions - Quotes & Purchase Orders
+# ============================================================================
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def xero_get_quotes(
+    status: Optional[str] = Field(None, description="Filter: 'DRAFT', 'SENT', 'ACCEPTED', 'DECLINED'"),
+    contact_name: Optional[str] = Field(None, description="Filter by contact name"),
+    days: int = Field(90, description="Quotes from last N days"),
+    limit: int = Field(20, description="Max results")
+) -> str:
+    """Get quotes/proposals."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+
+        where_parts = []
+        if status:
+            where_parts.append(f'Status=="{status.upper()}"')
+
+        since_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        where_parts.append(f'Date>=DateTime({since_date.replace("-", ",")})')
+
+        params = {"order": "Date DESC"}
+        if where_parts:
+            params["where"] = " AND ".join(where_parts)
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.xero.com/api.xro/2.0/Quotes",
+                params=params,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json"
+                }
+            )
+            response.raise_for_status()
+            quotes = response.json().get("Quotes", [])
+
+        if contact_name:
+            quotes = [q for q in quotes if contact_name.lower() in q.get("Contact", {}).get("Name", "").lower()]
+
+        quotes = quotes[:limit]
+
+        if not quotes:
+            return "No quotes found."
+
+        results = []
+        for q in quotes:
+            contact = q.get("Contact", {}).get("Name", "Unknown")
+            quote_num = q.get("QuoteNumber", "N/A")
+            status_val = q.get("Status", "N/A")
+            total = q.get("Total", 0)
+            date_str = q.get("DateString", "")[:10]
+            title = q.get("Title", "")
+
+            results.append(f"**{quote_num}** - {contact}\n  {title}\n  Status: {status_val} | Total: ${total:,.2f} | Date: {date_str}")
+
+        return f"Found {len(results)} quote(s):\n\n" + "\n\n".join(results)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def xero_create_quote(
+    contact_name: str = Field(..., description="Contact name"),
+    line_items: str = Field(..., description='JSON array: [{"description": "...", "quantity": 1, "unit_amount": 100.00, "account_code": "200"}]'),
+    title: Optional[str] = Field(None, description="Quote title"),
+    summary: Optional[str] = Field(None, description="Quote summary"),
+    expiry_days: int = Field(30, description="Days until expiry"),
+    status: str = Field("DRAFT", description="Status: 'DRAFT' or 'SENT'")
+) -> str:
+    """Create a quote/proposal."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+        items = json.loads(line_items)
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.xero.com/api.xro/2.0/Contacts",
+                params={"where": f'Name.Contains("{contact_name}")'},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json"
+                }
+            )
+            response.raise_for_status()
+            contacts = response.json().get("Contacts", [])
+
+        if not contacts:
+            return f"Error: Contact '{contact_name}' not found."
+
+        quote_data = {
+            "Contact": {"ContactID": contacts[0]["ContactID"]},
+            "Date": datetime.now().strftime("%Y-%m-%d"),
+            "ExpiryDate": (datetime.now() + timedelta(days=expiry_days)).strftime("%Y-%m-%d"),
+            "LineItems": [
+                {
+                    "Description": item.get("description", ""),
+                    "Quantity": item.get("quantity", 1),
+                    "UnitAmount": item.get("unit_amount", 0),
+                    "AccountCode": item.get("account_code", "200")
+                }
+                for item in items
+            ],
+            "Status": status.upper()
+        }
+
+        if title:
+            quote_data["Title"] = title
+        if summary:
+            quote_data["Summary"] = summary
+
+        async with httpx.AsyncClient() as client:
+            response = await client.put(
+                "https://api.xero.com/api.xro/2.0/Quotes",
+                json={"Quotes": [quote_data]},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json",
+                    "Content-Type": "application/json"
+                }
+            )
+            response.raise_for_status()
+            created = response.json().get("Quotes", [{}])[0]
+
+        return f"✅ Quote created: **{created.get('QuoteNumber', 'N/A')}** for ${created.get('Total', 0):,.2f}"
+    except json.JSONDecodeError:
+        return "Error: Invalid JSON in line_items."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def xero_get_purchase_orders(
+    status: Optional[str] = Field(None, description="Filter: 'DRAFT', 'SUBMITTED', 'AUTHORISED', 'BILLED'"),
+    contact_name: Optional[str] = Field(None, description="Filter by supplier name"),
+    days: int = Field(90, description="POs from last N days"),
+    limit: int = Field(20, description="Max results")
+) -> str:
+    """Get purchase orders."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+
+        where_parts = []
+        if status:
+            where_parts.append(f'Status=="{status.upper()}"')
+
+        since_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        where_parts.append(f'Date>=DateTime({since_date.replace("-", ",")})')
+
+        params = {"order": "Date DESC"}
+        if where_parts:
+            params["where"] = " AND ".join(where_parts)
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.xero.com/api.xro/2.0/PurchaseOrders",
+                params=params,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json"
+                }
+            )
+            response.raise_for_status()
+            pos = response.json().get("PurchaseOrders", [])
+
+        if contact_name:
+            pos = [po for po in pos if contact_name.lower() in po.get("Contact", {}).get("Name", "").lower()]
+
+        pos = pos[:limit]
+
+        if not pos:
+            return "No purchase orders found."
+
+        results = []
+        for po in pos:
+            contact = po.get("Contact", {}).get("Name", "Unknown")
+            po_num = po.get("PurchaseOrderNumber", "N/A")
+            status_val = po.get("Status", "N/A")
+            total = po.get("Total", 0)
+            date_str = po.get("DateString", "")[:10]
+
+            results.append(f"**{po_num}** - {contact}\n  Status: {status_val} | Total: ${total:,.2f} | Date: {date_str}")
+
+        return f"Found {len(results)} purchase order(s):\n\n" + "\n\n".join(results)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def xero_create_purchase_order(
+    contact_name: str = Field(..., description="Supplier name"),
+    line_items: str = Field(..., description='JSON array: [{"description": "...", "quantity": 1, "unit_amount": 100.00, "account_code": "400"}]'),
+    delivery_date: Optional[str] = Field(None, description="Expected delivery date (YYYY-MM-DD)"),
+    reference: Optional[str] = Field(None, description="PO reference"),
+    status: str = Field("DRAFT", description="Status: 'DRAFT' or 'SUBMITTED'")
+) -> str:
+    """Create a purchase order."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+        items = json.loads(line_items)
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.xero.com/api.xro/2.0/Contacts",
+                params={"where": f'Name.Contains("{contact_name}")'},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json"
+                }
+            )
+            response.raise_for_status()
+            contacts = response.json().get("Contacts", [])
+
+        if not contacts:
+            return f"Error: Supplier '{contact_name}' not found."
+
+        po_data = {
+            "Contact": {"ContactID": contacts[0]["ContactID"]},
+            "Date": datetime.now().strftime("%Y-%m-%d"),
+            "LineItems": [
+                {
+                    "Description": item.get("description", ""),
+                    "Quantity": item.get("quantity", 1),
+                    "UnitAmount": item.get("unit_amount", 0),
+                    "AccountCode": item.get("account_code", "400")
+                }
+                for item in items
+            ],
+            "Status": status.upper()
+        }
+
+        if delivery_date:
+            po_data["DeliveryDate"] = delivery_date
+        if reference:
+            po_data["Reference"] = reference
+
+        async with httpx.AsyncClient() as client:
+            response = await client.put(
+                "https://api.xero.com/api.xro/2.0/PurchaseOrders",
+                json={"PurchaseOrders": [po_data]},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json",
+                    "Content-Type": "application/json"
+                }
+            )
+            response.raise_for_status()
+            created = response.json().get("PurchaseOrders", [{}])[0]
+
+        return f"✅ Purchase Order created: **{created.get('PurchaseOrderNumber', 'N/A')}** for ${created.get('Total', 0):,.2f}"
+    except json.JSONDecodeError:
+        return "Error: Invalid JSON in line_items."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def xero_get_bank_transactions(
+    bank_account_code: Optional[str] = Field(None, description="Filter by bank account code"),
+    transaction_type: Optional[str] = Field(None, description="Filter: 'SPEND' or 'RECEIVE'"),
+    days: int = Field(30, description="Transactions from last N days"),
+    limit: int = Field(50, description="Max results")
+) -> str:
+    """Get bank transactions (spend/receive money)."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+
+        where_parts = []
+        if transaction_type:
+            where_parts.append(f'Type=="{transaction_type.upper()}"')
+
+        since_date = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
+        where_parts.append(f'Date>=DateTime({since_date.replace("-", ",")})')
+
+        params = {"order": "Date DESC"}
+        if where_parts:
+            params["where"] = " AND ".join(where_parts)
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.xero.com/api.xro/2.0/BankTransactions",
+                params=params,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json"
+                }
+            )
+            response.raise_for_status()
+            transactions = response.json().get("BankTransactions", [])
+
+        if bank_account_code:
+            transactions = [t for t in transactions if t.get("BankAccount", {}).get("Code") == bank_account_code]
+
+        transactions = transactions[:limit]
+
+        if not transactions:
+            return "No bank transactions found."
+
+        results = []
+        for t in transactions:
+            contact = t.get("Contact", {}).get("Name", "Unknown")
+            tx_type = t.get("Type", "N/A")
+            total = t.get("Total", 0)
+            date_str = t.get("DateString", "")[:10]
+            reference = t.get("Reference", "")
+            bank = t.get("BankAccount", {}).get("Name", "N/A")
+
+            results.append(f"**{tx_type}** ${total:,.2f} - {contact}\n  Bank: {bank} | Date: {date_str} | Ref: {reference or 'N/A'}")
+
+        return f"Found {len(results)} transaction(s):\n\n" + "\n\n".join(results)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def xero_create_contact(
+    name: str = Field(..., description="Contact/company name"),
+    email: Optional[str] = Field(None, description="Email address"),
+    first_name: Optional[str] = Field(None, description="First name"),
+    last_name: Optional[str] = Field(None, description="Last name"),
+    phone: Optional[str] = Field(None, description="Phone number"),
+    is_customer: bool = Field(True, description="Is a customer"),
+    is_supplier: bool = Field(False, description="Is a supplier")
+) -> str:
+    """Create a new contact."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+
+        contact_data = {
+            "Name": name,
+            "IsCustomer": is_customer,
+            "IsSupplier": is_supplier
+        }
+
+        if email:
+            contact_data["EmailAddress"] = email
+        if first_name:
+            contact_data["FirstName"] = first_name
+        if last_name:
+            contact_data["LastName"] = last_name
+        if phone:
+            contact_data["Phones"] = [{"PhoneType": "DEFAULT", "PhoneNumber": phone}]
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.xero.com/api.xro/2.0/Contacts",
+                json={"Contacts": [contact_data]},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json",
+                    "Content-Type": "application/json"
+                }
+            )
+            response.raise_for_status()
+            created = response.json().get("Contacts", [{}])[0]
+
+        return f"✅ Contact created: **{created.get('Name', name)}** (ID: {created.get('ContactID', 'N/A')})"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def xero_update_contact(
+    contact_id: str = Field(..., description="Contact ID (GUID)"),
+    name: Optional[str] = Field(None, description="Update name"),
+    email: Optional[str] = Field(None, description="Update email"),
+    phone: Optional[str] = Field(None, description="Update phone"),
+    is_customer: Optional[bool] = Field(None, description="Set as customer"),
+    is_supplier: Optional[bool] = Field(None, description="Set as supplier")
+) -> str:
+    """Update an existing contact."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+
+        contact_data = {"ContactID": contact_id}
+
+        if name:
+            contact_data["Name"] = name
+        if email:
+            contact_data["EmailAddress"] = email
+        if phone:
+            contact_data["Phones"] = [{"PhoneType": "DEFAULT", "PhoneNumber": phone}]
+        if is_customer is not None:
+            contact_data["IsCustomer"] = is_customer
+        if is_supplier is not None:
+            contact_data["IsSupplier"] = is_supplier
+
+        if len(contact_data) == 1:
+            return "Error: No updates specified."
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                "https://api.xero.com/api.xro/2.0/Contacts",
+                json={"Contacts": [contact_data]},
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json",
+                    "Content-Type": "application/json"
+                }
+            )
+            response.raise_for_status()
+            updated = response.json().get("Contacts", [{}])[0]
+
+        return f"✅ Contact **{updated.get('Name', contact_id)}** updated."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+# ============================================================================
+# Xero Extended Functions - Reports & Reference Data
+# ============================================================================
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def xero_profit_loss(
+    from_date: Optional[str] = Field(None, description="Start date (YYYY-MM-DD), defaults to start of current financial year"),
+    to_date: Optional[str] = Field(None, description="End date (YYYY-MM-DD), defaults to today")
+) -> str:
+    """Get Profit & Loss report."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+
+        params = {}
+        if from_date:
+            params["fromDate"] = from_date
+        if to_date:
+            params["toDate"] = to_date
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.xero.com/api.xro/2.0/Reports/ProfitAndLoss",
+                params=params,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json"
+                }
+            )
+            response.raise_for_status()
+            report = response.json().get("Reports", [{}])[0]
+
+        lines = [f"# Profit & Loss Report", f"**Period:** {report.get('ReportDate', 'N/A')}\n"]
+
+        for row in report.get("Rows", []):
+            row_type = row.get("RowType")
+
+            if row_type == "Header":
+                continue
+            elif row_type == "Section":
+                title = row.get("Title", "")
+                if title:
+                    lines.append(f"\n## {title}")
+                for sub_row in row.get("Rows", []):
+                    if sub_row.get("RowType") == "Row":
+                        cells = sub_row.get("Cells", [])
+                        if len(cells) >= 2:
+                            account = cells[0].get("Value", "")
+                            amount = cells[1].get("Value", "0")
+                            try:
+                                amount_val = float(amount)
+                                lines.append(f"- {account}: ${amount_val:,.2f}")
+                            except (ValueError, TypeError):
+                                lines.append(f"- {account}: {amount}")
+                    elif sub_row.get("RowType") == "SummaryRow":
+                        cells = sub_row.get("Cells", [])
+                        if len(cells) >= 2:
+                            label = cells[0].get("Value", "Total")
+                            amount = cells[1].get("Value", "0")
+                            try:
+                                amount_val = float(amount)
+                                lines.append(f"**{label}: ${amount_val:,.2f}**")
+                            except (ValueError, TypeError):
+                                lines.append(f"**{label}: {amount}**")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def xero_balance_sheet(
+    date: Optional[str] = Field(None, description="Report date (YYYY-MM-DD), defaults to today")
+) -> str:
+    """Get Balance Sheet report."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+
+        params = {}
+        if date:
+            params["date"] = date
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.xero.com/api.xro/2.0/Reports/BalanceSheet",
+                params=params,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json"
+                }
+            )
+            response.raise_for_status()
+            report = response.json().get("Reports", [{}])[0]
+
+        lines = [f"# Balance Sheet", f"**As at:** {report.get('ReportDate', 'N/A')}\n"]
+
+        for row in report.get("Rows", []):
+            row_type = row.get("RowType")
+
+            if row_type == "Section":
+                title = row.get("Title", "")
+                if title:
+                    lines.append(f"\n## {title}")
+                for sub_row in row.get("Rows", []):
+                    if sub_row.get("RowType") == "Row":
+                        cells = sub_row.get("Cells", [])
+                        if len(cells) >= 2:
+                            account = cells[0].get("Value", "")
+                            amount = cells[1].get("Value", "0")
+                            try:
+                                amount_val = float(amount)
+                                lines.append(f"- {account}: ${amount_val:,.2f}")
+                            except (ValueError, TypeError):
+                                lines.append(f"- {account}: {amount}")
+                    elif sub_row.get("RowType") == "SummaryRow":
+                        cells = sub_row.get("Cells", [])
+                        if len(cells) >= 2:
+                            label = cells[0].get("Value", "Total")
+                            amount = cells[1].get("Value", "0")
+                            try:
+                                amount_val = float(amount)
+                                lines.append(f"**{label}: ${amount_val:,.2f}**")
+                            except (ValueError, TypeError):
+                                lines.append(f"**{label}: {amount}**")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def xero_trial_balance(
+    date: Optional[str] = Field(None, description="Report date (YYYY-MM-DD), defaults to today")
+) -> str:
+    """Get Trial Balance report."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+
+        params = {}
+        if date:
+            params["date"] = date
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.xero.com/api.xro/2.0/Reports/TrialBalance",
+                params=params,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json"
+                }
+            )
+            response.raise_for_status()
+            report = response.json().get("Reports", [{}])[0]
+
+        lines = [f"# Trial Balance", f"**As at:** {report.get('ReportDate', 'N/A')}\n"]
+        lines.append("| Account | Debit | Credit |")
+        lines.append("|---------|-------|--------|")
+
+        for row in report.get("Rows", []):
+            if row.get("RowType") == "Section":
+                for sub_row in row.get("Rows", []):
+                    if sub_row.get("RowType") == "Row":
+                        cells = sub_row.get("Cells", [])
+                        if len(cells) >= 3:
+                            account = cells[0].get("Value", "")
+                            debit = cells[1].get("Value", "")
+                            credit = cells[2].get("Value", "")
+                            lines.append(f"| {account} | {debit} | {credit} |")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def xero_bank_summary() -> str:
+    """Get bank accounts summary with balances."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.xero.com/api.xro/2.0/Reports/BankSummary",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json"
+                }
+            )
+            response.raise_for_status()
+            report = response.json().get("Reports", [{}])[0]
+
+        lines = [f"# Bank Summary", f"**As at:** {report.get('ReportDate', 'N/A')}\n"]
+
+        for row in report.get("Rows", []):
+            if row.get("RowType") == "Section":
+                for sub_row in row.get("Rows", []):
+                    if sub_row.get("RowType") == "Row":
+                        cells = sub_row.get("Cells", [])
+                        if len(cells) >= 2:
+                            account = cells[0].get("Value", "")
+                            balance = cells[1].get("Value", "0")
+                            try:
+                                balance_val = float(balance)
+                                lines.append(f"- **{account}**: ${balance_val:,.2f}")
+                            except (ValueError, TypeError):
+                                lines.append(f"- **{account}**: {balance}")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def xero_aged_payables(
+    contact_name: Optional[str] = Field(None, description="Filter by supplier name"),
+    min_amount: float = Field(0, description="Minimum amount owed")
+) -> str:
+    """Get aged payables report - what you owe to suppliers."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.xero.com/api.xro/2.0/Reports/AgedPayablesByContact",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json"
+                }
+            )
+            response.raise_for_status()
+            report = response.json().get("Reports", [{}])[0]
+
+        rows = report.get("Rows", [])
+        results = []
+
+        for section in rows:
+            if section.get("RowType") == "Section":
+                for row in section.get("Rows", []):
+                    if row.get("RowType") == "Row":
+                        cells = row.get("Cells", [])
+                        if len(cells) >= 6:
+                            name = cells[0].get("Value", "")
+                            total = float(cells[5].get("Value", 0) or 0)
+
+                            if contact_name and contact_name.lower() not in name.lower():
+                                continue
+                            if total < min_amount:
+                                continue
+
+                            current = float(cells[1].get("Value", 0) or 0)
+                            days_30 = float(cells[2].get("Value", 0) or 0)
+                            days_60 = float(cells[3].get("Value", 0) or 0)
+                            days_90 = float(cells[4].get("Value", 0) or 0)
+
+                            results.append(f"**{name}**\n  Current: ${current:,.2f} | 30d: ${days_30:,.2f} | 60d: ${days_60:,.2f} | 90d+: ${days_90:,.2f} | **Total: ${total:,.2f}**")
+
+        if not results:
+            return "No outstanding payables found."
+
+        return "## Aged Payables\n\n" + "\n\n".join(results)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def xero_get_accounts(
+    account_type: Optional[str] = Field(None, description="Filter by type: 'BANK', 'REVENUE', 'EXPENSE', 'ASSET', 'LIABILITY', etc."),
+    account_class: Optional[str] = Field(None, description="Filter by class: 'ASSET', 'EQUITY', 'EXPENSE', 'LIABILITY', 'REVENUE'")
+) -> str:
+    """Get chart of accounts."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+
+        params = {}
+        where_parts = []
+        if account_type:
+            where_parts.append(f'Type=="{account_type.upper()}"')
+        if account_class:
+            where_parts.append(f'Class=="{account_class.upper()}"')
+        if where_parts:
+            params["where"] = " AND ".join(where_parts)
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.xero.com/api.xro/2.0/Accounts",
+                params=params,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json"
+                }
+            )
+            response.raise_for_status()
+            accounts = response.json().get("Accounts", [])
+
+        if not accounts:
+            return "No accounts found."
+
+        # Group by class
+        by_class = {}
+        for acc in accounts:
+            acc_class = acc.get("Class", "Other")
+            if acc_class not in by_class:
+                by_class[acc_class] = []
+            by_class[acc_class].append(acc)
+
+        lines = ["# Chart of Accounts\n"]
+        for acc_class, accs in sorted(by_class.items()):
+            lines.append(f"\n## {acc_class}")
+            for acc in sorted(accs, key=lambda x: x.get("Code", "")):
+                code = acc.get("Code", "N/A")
+                name = acc.get("Name", "Unknown")
+                acc_type = acc.get("Type", "N/A")
+                lines.append(f"- **{code}** - {name} ({acc_type})")
+
+        return "\n".join(lines)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def xero_get_items(
+    search: Optional[str] = Field(None, description="Search by code or name"),
+    limit: int = Field(50, description="Max results")
+) -> str:
+    """Get product/service items."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.xero.com/api.xro/2.0/Items",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json"
+                }
+            )
+            response.raise_for_status()
+            items = response.json().get("Items", [])
+
+        if search:
+            search_lower = search.lower()
+            items = [i for i in items if search_lower in i.get("Code", "").lower() or search_lower in i.get("Name", "").lower()]
+
+        items = items[:limit]
+
+        if not items:
+            return "No items found."
+
+        results = []
+        for item in items:
+            code = item.get("Code", "N/A")
+            name = item.get("Name", "Unknown")
+            desc = item.get("Description", "")[:50]
+            sell_price = item.get("SalesDetails", {}).get("UnitPrice", 0)
+            buy_price = item.get("PurchaseDetails", {}).get("UnitPrice", 0)
+
+            results.append(f"**{code}** - {name}\n  {desc}\n  Sell: ${sell_price:,.2f} | Buy: ${buy_price:,.2f}")
+
+        return f"Found {len(results)} item(s):\n\n" + "\n\n".join(results)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def xero_get_tax_rates() -> str:
+    """Get available tax rates."""
+    if not xero_config.is_configured:
+        return "Error: Xero not configured."
+
+    try:
+        token = await xero_config.get_access_token()
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://api.xero.com/api.xro/2.0/TaxRates",
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Xero-Tenant-Id": xero_config.tenant_id,
+                    "Accept": "application/json"
+                }
+            )
+            response.raise_for_status()
+            tax_rates = response.json().get("TaxRates", [])
+
+        if not tax_rates:
+            return "No tax rates found."
+
+        results = []
+        for tr in tax_rates:
+            name = tr.get("Name", "Unknown")
+            tax_type = tr.get("TaxType", "N/A")
+            rate = tr.get("EffectiveRate", tr.get("DisplayTaxRate", 0))
+            status = tr.get("Status", "N/A")
+
+            if status == "ACTIVE":
+                results.append(f"- **{name}** ({tax_type}): {rate}%")
+
+        return "## Tax Rates\n\n" + "\n".join(results)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+# ============================================================================
 # Front Integration
 # ============================================================================
 
