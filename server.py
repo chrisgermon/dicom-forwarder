@@ -1105,8 +1105,8 @@ async def halopsa_get_recurring_invoice(recurring_invoice_id: int = Field(..., d
 async def halopsa_add_recurring_invoice_line(
     recurring_invoice_id: int = Field(..., description="Recurring Invoice ID"),
     description: str = Field(..., description="Line item description"),
-    quantity: float = Field(1, description="Quantity"),
     unit_price: float = Field(..., description="Unit price (ex tax)"),
+    quantity: float = Field(1, description="Quantity"),
     item_id: Optional[int] = Field(None, description="HaloPSA Item ID (optional - for linking to catalog item)"),
     tax_code: str = Field("GST", description="Tax code (default: GST)")
 ) -> str:
