@@ -1478,6 +1478,434 @@ async def halopsa_update_recurring_invoice(
 
 
 # ============================================================================
+# HaloPSA Items API
+# ============================================================================
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def halopsa_get_items(
+    search: Optional[str] = Field(None, description="Search by item name, SKU, or description"),
+    category_id: Optional[int] = Field(None, description="Filter by category ID"),
+    item_type: Optional[str] = Field(None, description="Filter by item type: 'stock', 'non_stock', 'service', 'labour', 'all'"),
+    include_inactive: bool = Field(False, description="Include inactive items"),
+    supplier_id: Optional[int] = Field(None, description="Filter by supplier ID"),
+    limit: int = Field(50, description="Max results (1-100)")
+) -> str:
+    """List HaloPSA items/products from the catalog."""
+    if not halopsa_config.is_configured:
+        return "Error: HaloPSA not configured."
+
+    try:
+        token = await halopsa_config.get_access_token()
+        params = {"count": min(max(1, limit), 100)}
+
+        if search:
+            params["search"] = search
+        if category_id:
+            params["category_id"] = category_id
+        if supplier_id:
+            params["supplier_id"] = supplier_id
+        if not include_inactive:
+            params["includeinactive"] = "false"
+
+        # Map item type to HaloPSA type IDs
+        if item_type:
+            type_map = {
+                "stock": 1,
+                "non_stock": 2,
+                "service": 3,
+                "labour": 4,
+                "labor": 4
+            }
+            if item_type.lower() in type_map:
+                params["itemtype_id"] = type_map[item_type.lower()]
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{halopsa_config.resource_server}/Item",
+                params=params,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            )
+            response.raise_for_status()
+            items = response.json().get("items", [])
+
+        if not items:
+            return "No items found."
+
+        results = []
+        for item in items[:limit]:
+            item_id = item.get('id', 'N/A')
+            name = item.get('name', item.get('itemname', 'Unknown'))
+            sku = item.get('sku', item.get('partnumber', 'N/A'))
+            price = item.get('baseprice', item.get('price', item.get('unitprice', 0)))
+            cost = item.get('cost', item.get('unitcost', 0))
+            category = item.get('category_name', item.get('categoryname', 'N/A'))
+            active = "Active" if not item.get('inactive', False) else "Inactive"
+            stock_level = item.get('stocklevel', item.get('stock_level', ''))
+
+            stock_str = f" | Stock: {stock_level}" if stock_level != '' else ""
+            results.append(f"**{name}** (ID: {item_id})\n  SKU: {sku} | Price: ${price:,.2f} | Cost: ${cost:,.2f}{stock_str}\n  Category: {category} | {active}")
+
+        return f"Found {len(results)} item(s):\n\n" + "\n\n".join(results)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def halopsa_get_item(
+    item_id: int = Field(..., description="Item ID"),
+    include_stock: bool = Field(True, description="Include stock level information")
+) -> str:
+    """Get detailed item information including pricing and stock."""
+    if not halopsa_config.is_configured:
+        return "Error: HaloPSA not configured."
+
+    try:
+        token = await halopsa_config.get_access_token()
+        params = {"includedetails": "true"}
+        if include_stock:
+            params["includestock"] = "true"
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{halopsa_config.resource_server}/Item/{item_id}",
+                params=params,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            )
+            response.raise_for_status()
+            item = response.json()
+
+        name = item.get('name', item.get('itemname', 'Unknown'))
+        sku = item.get('sku', item.get('partnumber', 'N/A'))
+        price = item.get('baseprice', item.get('price', item.get('unitprice', 0)))
+        cost = item.get('cost', item.get('unitcost', 0))
+        category = item.get('category_name', item.get('categoryname', 'N/A'))
+        item_type = item.get('itemtype_name', item.get('type_name', 'N/A'))
+        active = "Active" if not item.get('inactive', False) else "Inactive"
+
+        # Stock information
+        stock_level = item.get('stocklevel', item.get('stock_level', 'N/A'))
+        reorder_level = item.get('reorderlevel', item.get('reorder_level', 'N/A'))
+
+        # Supplier info
+        supplier = item.get('supplier_name', item.get('suppliername', 'N/A'))
+        manufacturer = item.get('manufacturer', item.get('manufacturer_name', 'N/A'))
+
+        # Descriptions
+        short_desc = item.get('shortdescription', item.get('short_description', ''))
+        long_desc = item.get('longdescription', item.get('long_description', item.get('description', '')))
+
+        # Tax
+        tax_code = item.get('tax_code_name', item.get('taxcode', 'N/A'))
+
+        # Accounting
+        nominal_code = item.get('nominalcode', item.get('nominal_code', item.get('accountscode', 'N/A')))
+
+        return f"""# Item: {name}
+
+**ID:** {item.get('id')}
+**SKU/Part Number:** {sku}
+**Status:** {active}
+**Type:** {item_type}
+**Category:** {category}
+
+## Pricing
+**Selling Price:** ${price:,.2f}
+**Cost Price:** ${cost:,.2f}
+**Margin:** ${(price - cost):,.2f} ({((price - cost) / price * 100) if price > 0 else 0:.1f}%)
+**Tax Code:** {tax_code}
+
+## Stock
+**Current Stock Level:** {stock_level}
+**Reorder Level:** {reorder_level}
+
+## Supplier & Manufacturer
+**Supplier:** {supplier}
+**Manufacturer:** {manufacturer}
+
+## Description
+{short_desc}
+
+{long_desc if long_desc else ''}
+
+## Accounting
+**Nominal Code:** {nominal_code}"""
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def halopsa_create_item(
+    name: str = Field(..., description="Item name"),
+    sku: Optional[str] = Field(None, description="SKU/Part number"),
+    baseprice: float = Field(0, description="Selling price (ex tax)"),
+    cost: float = Field(0, description="Cost price"),
+    short_description: Optional[str] = Field(None, description="Short description"),
+    long_description: Optional[str] = Field(None, description="Long/detailed description"),
+    category_id: Optional[int] = Field(None, description="Category ID"),
+    item_type_id: int = Field(1, description="Item type: 1=Stock, 2=Non-Stock, 3=Service, 4=Labour"),
+    tax_code_id: int = Field(12, description="Tax code ID (default: 12 for GST)"),
+    supplier_id: Optional[int] = Field(None, description="Supplier ID"),
+    reorder_level: int = Field(0, description="Stock reorder level"),
+    nominal_code: Optional[str] = Field(None, description="Accounting nominal code")
+) -> str:
+    """Create a new item in the HaloPSA catalog."""
+    if not halopsa_config.is_configured:
+        return "Error: HaloPSA not configured."
+
+    try:
+        token = await halopsa_config.get_access_token()
+
+        payload = [{
+            "name": name,
+            "baseprice": baseprice,
+            "cost": cost,
+            "itemtype_id": item_type_id,
+            "tax_code_id": tax_code_id,
+            "reorderlevel": reorder_level,
+            "inactive": False
+        }]
+
+        if sku:
+            payload[0]["sku"] = sku
+        if short_description:
+            payload[0]["shortdescription"] = short_description
+        if long_description:
+            payload[0]["longdescription"] = long_description
+        if category_id:
+            payload[0]["category_id"] = category_id
+        if supplier_id:
+            payload[0]["supplier_id"] = supplier_id
+        if nominal_code:
+            payload[0]["nominalcode"] = nominal_code
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{halopsa_config.resource_server}/Item",
+                json=payload,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            )
+            response.raise_for_status()
+            result = response.json()
+
+        new_id = result[0].get('id') if isinstance(result, list) and result else result.get('id', 'Unknown')
+        return f"✅ Item created successfully.\n\n**ID:** {new_id}\n**Name:** {name}\n**SKU:** {sku or 'N/A'}\n**Price:** ${baseprice:,.2f}\n**Cost:** ${cost:,.2f}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def halopsa_update_item(
+    item_id: int = Field(..., description="Item ID to update"),
+    name: Optional[str] = Field(None, description="New item name"),
+    sku: Optional[str] = Field(None, description="New SKU/Part number"),
+    baseprice: Optional[float] = Field(None, description="New selling price (ex tax)"),
+    cost: Optional[float] = Field(None, description="New cost price"),
+    short_description: Optional[str] = Field(None, description="New short description"),
+    long_description: Optional[str] = Field(None, description="New long description"),
+    category_id: Optional[int] = Field(None, description="New category ID"),
+    inactive: Optional[bool] = Field(None, description="Set inactive status"),
+    reorder_level: Optional[int] = Field(None, description="New stock reorder level")
+) -> str:
+    """Update an existing item in the HaloPSA catalog."""
+    if not halopsa_config.is_configured:
+        return "Error: HaloPSA not configured."
+
+    # Check that at least one field is being updated
+    if not any([name, sku, baseprice is not None, cost is not None, short_description,
+                long_description, category_id, inactive is not None, reorder_level is not None]):
+        return "Error: At least one field must be provided to update."
+
+    try:
+        token = await halopsa_config.get_access_token()
+
+        payload = [{"id": item_id}]
+
+        if name is not None:
+            payload[0]["name"] = name
+        if sku is not None:
+            payload[0]["sku"] = sku
+        if baseprice is not None:
+            payload[0]["baseprice"] = baseprice
+        if cost is not None:
+            payload[0]["cost"] = cost
+        if short_description is not None:
+            payload[0]["shortdescription"] = short_description
+        if long_description is not None:
+            payload[0]["longdescription"] = long_description
+        if category_id is not None:
+            payload[0]["category_id"] = category_id
+        if inactive is not None:
+            payload[0]["inactive"] = inactive
+        if reorder_level is not None:
+            payload[0]["reorderlevel"] = reorder_level
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{halopsa_config.resource_server}/Item",
+                json=payload,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            )
+            response.raise_for_status()
+            result = response.json()
+
+        updated_name = result[0].get('name', 'Unknown') if isinstance(result, list) and result else 'Unknown'
+        return f"✅ Item #{item_id} updated successfully.\n**Name:** {updated_name}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True})
+async def halopsa_delete_item(
+    item_id: int = Field(..., description="Item ID to delete")
+) -> str:
+    """Delete an item from the HaloPSA catalog. This action cannot be undone."""
+    if not halopsa_config.is_configured:
+        return "Error: HaloPSA not configured."
+
+    try:
+        token = await halopsa_config.get_access_token()
+
+        async with httpx.AsyncClient() as client:
+            response = await client.delete(
+                f"{halopsa_config.resource_server}/Item/{item_id}",
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            )
+            response.raise_for_status()
+
+        return f"✅ Item #{item_id} deleted successfully."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def halopsa_get_item_categories(
+    search: Optional[str] = Field(None, description="Search by category name"),
+    limit: int = Field(50, description="Max results")
+) -> str:
+    """List item categories in HaloPSA."""
+    if not halopsa_config.is_configured:
+        return "Error: HaloPSA not configured."
+
+    try:
+        token = await halopsa_config.get_access_token()
+        params = {"count": min(limit, 100)}
+
+        if search:
+            params["search"] = search
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{halopsa_config.resource_server}/ItemCategory",
+                params=params,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            )
+            response.raise_for_status()
+            categories = response.json().get("categories", response.json().get("itemcategories", []))
+
+        if not categories:
+            return "No item categories found."
+
+        results = []
+        for cat in categories[:limit]:
+            cat_id = cat.get('id', 'N/A')
+            name = cat.get('name', cat.get('categoryname', 'Unknown'))
+            parent = cat.get('parent_name', cat.get('parentname', 'None'))
+
+            results.append(f"**{name}** (ID: {cat_id})\n  Parent: {parent}")
+
+        return f"Found {len(results)} category(ies):\n\n" + "\n\n".join(results)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def halopsa_get_item_stock(
+    item_id: Optional[int] = Field(None, description="Filter by item ID"),
+    warehouse_id: Optional[int] = Field(None, description="Filter by warehouse/location ID"),
+    low_stock_only: bool = Field(False, description="Only show items below reorder level"),
+    limit: int = Field(50, description="Max results")
+) -> str:
+    """Get stock levels for items. Can filter by item, warehouse, or show only low stock items."""
+    if not halopsa_config.is_configured:
+        return "Error: HaloPSA not configured."
+
+    try:
+        token = await halopsa_config.get_access_token()
+        params = {"count": min(limit, 100)}
+
+        if item_id:
+            params["item_id"] = item_id
+        if warehouse_id:
+            params["warehouse_id"] = warehouse_id
+        if low_stock_only:
+            params["lowstock"] = "true"
+
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{halopsa_config.resource_server}/ItemStock",
+                params=params,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            )
+            response.raise_for_status()
+            stock_items = response.json().get("stocks", response.json().get("itemstocks", []))
+
+        if not stock_items:
+            return "No stock information found."
+
+        results = []
+        for s in stock_items[:limit]:
+            item_name = s.get('item_name', s.get('itemname', 'Unknown'))
+            stock_level = s.get('stocklevel', s.get('stock_level', s.get('qty', 0)))
+            reorder = s.get('reorderlevel', s.get('reorder_level', 0))
+            warehouse = s.get('warehouse_name', s.get('warehousename', s.get('location', 'Default')))
+            item_id_val = s.get('item_id', s.get('itemid', 'N/A'))
+
+            status = "⚠️ LOW" if stock_level < reorder else "✓"
+            results.append(f"**{item_name}** (Item ID: {item_id_val})\n  Stock: {stock_level} | Reorder Level: {reorder} | Warehouse: {warehouse} {status}")
+
+        return f"Found {len(results)} stock record(s):\n\n" + "\n\n".join(results)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def halopsa_adjust_item_stock(
+    item_id: int = Field(..., description="Item ID"),
+    quantity: int = Field(..., description="Quantity to add (positive) or remove (negative)"),
+    warehouse_id: Optional[int] = Field(None, description="Warehouse/location ID (defaults to primary)"),
+    note: str = Field("", description="Reason for stock adjustment")
+) -> str:
+    """Adjust stock level for an item (add or remove stock)."""
+    if not halopsa_config.is_configured:
+        return "Error: HaloPSA not configured."
+
+    try:
+        token = await halopsa_config.get_access_token()
+
+        payload = [{
+            "item_id": item_id,
+            "quantity": quantity,
+            "note": note or f"Stock adjustment: {'+' if quantity > 0 else ''}{quantity}"
+        }]
+
+        if warehouse_id:
+            payload[0]["warehouse_id"] = warehouse_id
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{halopsa_config.resource_server}/ItemStock",
+                json=payload,
+                headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+            )
+            response.raise_for_status()
+
+        action = "added to" if quantity > 0 else "removed from"
+        return f"✅ Stock adjusted: {abs(quantity)} units {action} item #{item_id}."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+# ============================================================================
 # Xero Integration
 # ============================================================================
 
