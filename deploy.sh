@@ -97,6 +97,7 @@ gcloud run deploy $SERVICE_NAME \
     --project=$PROJECT_ID \
     --region=$REGION \
     --source=. \
+    --no-cache \
     --platform=managed \
     --no-allow-unauthenticated \
     --memory=512Mi \
