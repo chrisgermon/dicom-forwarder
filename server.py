@@ -34,7 +34,8 @@ def get_secret_sync(secret_id: str) -> Optional[str]:
     try:
         from google.cloud import secretmanager
         client = secretmanager.SecretManagerServiceClient()
-        project_id = os.getenv("GOOGLE_CLOUD_PROJECT", os.getenv("BIGQUERY_PROJECT_ID", "crowdmcp"))
+        # Use GCP_PROJECT_ID first (explicitly set in Cloud Run), then GOOGLE_CLOUD_PROJECT, then default
+        project_id = os.getenv("GCP_PROJECT_ID", os.getenv("GOOGLE_CLOUD_PROJECT", "crowdmcp"))
         name = f"projects/{project_id}/secrets/{secret_id}/versions/latest"
 
         response = client.access_secret_version(request={"name": name})
@@ -49,7 +50,8 @@ def update_secret_sync(secret_id: str, value: str) -> bool:
     try:
         from google.cloud import secretmanager
         client = secretmanager.SecretManagerServiceClient()
-        project_id = os.getenv("GOOGLE_CLOUD_PROJECT", os.getenv("BIGQUERY_PROJECT_ID", "crowdmcp"))
+        # Use GCP_PROJECT_ID first (explicitly set in Cloud Run), then GOOGLE_CLOUD_PROJECT, then default
+        project_id = os.getenv("GCP_PROJECT_ID", os.getenv("GOOGLE_CLOUD_PROJECT", "crowdmcp"))
         parent = f"projects/{project_id}/secrets/{secret_id}"
 
         client.add_secret_version(
