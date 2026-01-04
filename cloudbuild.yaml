@@ -19,16 +19,16 @@
 #     --name="deploy-on-main-merge"
 
 steps:
-  # Build the container image (--no-cache ensures latest code is always used)
+  # Build the container image
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['build', '--no-cache', '-t', 'gcr.io/$PROJECT_ID/crowdit-mcp-server:$COMMIT_SHA', '-t', 'gcr.io/$PROJECT_ID/crowdit-mcp-server:latest', '.']
+    args: ['build', '-t', 'australia-southeast1-docker.pkg.dev/$PROJECT_ID/crowdit/crowdit-mcp-server:$COMMIT_SHA', '-t', 'australia-southeast1-docker.pkg.dev/$PROJECT_ID/crowdit/crowdit-mcp-server:latest', '.']
 
-  # Push the container image to Container Registry
+  # Push the container image to Artifact Registry
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['push', 'gcr.io/$PROJECT_ID/crowdit-mcp-server:$COMMIT_SHA']
+    args: ['push', 'australia-southeast1-docker.pkg.dev/$PROJECT_ID/crowdit/crowdit-mcp-server:$COMMIT_SHA']
 
   - name: 'gcr.io/cloud-builders/docker'
-    args: ['push', 'gcr.io/$PROJECT_ID/crowdit-mcp-server:latest']
+    args: ['push', 'australia-southeast1-docker.pkg.dev/$PROJECT_ID/crowdit/crowdit-mcp-server:latest']
 
   # Deploy to Cloud Run
   - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
@@ -38,7 +38,7 @@ steps:
       - 'deploy'
       - 'crowdit-mcp-server'
       - '--image'
-      - 'gcr.io/$PROJECT_ID/crowdit-mcp-server:$COMMIT_SHA'
+      - 'australia-southeast1-docker.pkg.dev/$PROJECT_ID/crowdit/crowdit-mcp-server:$COMMIT_SHA'
       - '--region'
       - 'australia-southeast1'
       - '--platform'
@@ -70,8 +70,8 @@ steps:
       - '--set-secrets=FORTICLOUD_CLIENT_ID=FORTICLOUD_CLIENT_ID:latest'
 
 images:
-  - 'gcr.io/$PROJECT_ID/crowdit-mcp-server:$COMMIT_SHA'
-  - 'gcr.io/$PROJECT_ID/crowdit-mcp-server:latest'
+  - 'australia-southeast1-docker.pkg.dev/$PROJECT_ID/crowdit/crowdit-mcp-server:$COMMIT_SHA'
+  - 'australia-southeast1-docker.pkg.dev/$PROJECT_ID/crowdit/crowdit-mcp-server:latest'
 
 options:
   logging: CLOUD_LOGGING_ONLY

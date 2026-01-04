@@ -38,6 +38,20 @@ gcloud services enable \
     cloudbuild.googleapis.com \
     artifactregistry.googleapis.com
 
+# Create Artifact Registry repository if it doesn't exist
+echo ""
+echo "📦 Setting up Artifact Registry repository..."
+if gcloud artifacts repositories describe crowdit --location=$REGION --project=$PROJECT_ID >/dev/null 2>&1; then
+    echo "   ✓ Repository 'crowdit' already exists"
+else
+    gcloud artifacts repositories create crowdit \
+        --repository-format=docker \
+        --location=$REGION \
+        --project=$PROJECT_ID \
+        --description="Crowd IT MCP Server container images"
+    echo "   ✓ Created repository: crowdit"
+fi
+
 # Create secrets (with placeholder values - update later)
 echo ""
 echo "🔑 Setting up secrets..."
@@ -103,7 +117,6 @@ gcloud run deploy $SERVICE_NAME \
     --project=$PROJECT_ID \
     --region=$REGION \
     --source=. \
-    --no-cache \
     --platform=managed \
     --no-allow-unauthenticated \
     --memory=512Mi \
