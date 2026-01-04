@@ -5229,9 +5229,22 @@ pax8_config = Pax8Config()
 # ============================================================================
 
 class BigQueryConfig:
-    """BigQuery configuration from environment variables."""
+    """BigQuery configuration from environment variables.
+
+    Environment variables:
+    - BIGQUERY_PROJECT_ID: Default project for data/table references (e.g., 'crowdmcp')
+    - BIGQUERY_JOB_PROJECT_ID: Project where query jobs run and are billed (optional, defaults to BIGQUERY_PROJECT_ID)
+    - GOOGLE_APPLICATION_CREDENTIALS_JSON: Service account JSON for Cloud Run (optional, uses ADC if not set)
+
+    Required IAM permissions:
+    - The service account needs 'roles/bigquery.jobUser' (bigquery.jobs.create) on the JOB project
+    - The service account needs 'roles/bigquery.dataViewer' on any projects containing data to query
+    """
     def __init__(self):
         self.project_id = os.getenv("BIGQUERY_PROJECT_ID", "")
+        # Job project is where queries run and billing happens - defaults to project_id
+        # The service account MUST have bigquery.jobs.create permission on this project
+        self.job_project_id = os.getenv("BIGQUERY_JOB_PROJECT_ID", "") or self.project_id
         self.credentials_json = os.getenv("GOOGLE_APPLICATION_CREDENTIALS_JSON", "")
         self._client = None
 
@@ -5240,7 +5253,11 @@ class BigQueryConfig:
         return bool(self.project_id)
 
     def get_client(self):
-        """Get or create BigQuery client with proper credentials."""
+        """Get or create BigQuery client with proper credentials.
+
+        The client is initialized with job_project_id to ensure queries run
+        in a project where the service account has bigquery.jobs.create permission.
+        """
         if self._client is None:
             try:
                 from google.cloud import bigquery
@@ -5250,10 +5267,11 @@ class BigQueryConfig:
                     from google.oauth2 import service_account
                     credentials_info = json.loads(self.credentials_json)
                     credentials = service_account.Credentials.from_service_account_info(credentials_info)
-                    self._client = bigquery.Client(project=self.project_id, credentials=credentials)
+                    # Use job_project_id for client - this is where jobs are created/billed
+                    self._client = bigquery.Client(project=self.job_project_id, credentials=credentials)
                 else:
                     # Use Application Default Credentials
-                    self._client = bigquery.Client(project=self.project_id)
+                    self._client = bigquery.Client(project=self.job_project_id)
             except ImportError:
                 raise ImportError("google-cloud-bigquery package not installed")
 
@@ -5522,6 +5540,11 @@ async def bigquery_query(
     """
     Execute a SQL query against BigQuery and return results as markdown table.
     Use this for querying RIS data from Karisma radiology databases.
+
+    Cross-Project Queries:
+    - Jobs run in BIGQUERY_JOB_PROJECT_ID (requires bigquery.jobs.create permission)
+    - Data can be queried from any project using fully qualified table names: `project.dataset.table`
+    - Use fully qualified names when querying other projects (e.g., `vision-radiology.dataset.table`)
 
     Common datasets in crowdmcp project:
     - karisma_warehouse: Radiology data synced from Karisma RIS systems
@@ -7152,7 +7175,8 @@ async def server_status() -> str:
             client = bigquery_config.get_client()
             # Quick connectivity test
             list(client.list_datasets(max_results=1))
-            lines.append(f"✅ **BigQuery:** Connected (project: {bigquery_config.project_id})")
+            job_info = f", jobs: {bigquery_config.job_project_id}" if bigquery_config.job_project_id != bigquery_config.project_id else ""
+            lines.append(f"✅ **BigQuery:** Connected (data: {bigquery_config.project_id}{job_info})")
         except Exception as e:
             lines.append(f"❌ **BigQuery:** Error - {str(e)[:50]}")
     else:
