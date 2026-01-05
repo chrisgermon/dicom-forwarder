@@ -8589,134 +8589,181 @@ if __name__ == "__main__":
         except Exception as e:
             return HTMLResponse(f"<html><body><h1>Error</h1><p>{str(e)}</p></body></html>", status_code=500)
 
-    async def status_page_route(request):
-        """Web-based status page showing all service integrations."""
-        from datetime import datetime
+    # ============================================================================
+    # PLATFORM REGISTRY - Add new platforms here for automatic status page updates
+    # ============================================================================
+    # Each entry: (name, config_obj, category, check_type, env_vars_for_missing)
+    # check_type: "oauth" (calls get_access_token), "api_key" (just checks configured),
+    #             "bigquery", "ssh_ubuntu", "ssh_visionrad"
 
-        check_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
+    PLATFORM_REGISTRY = [
+        {
+            "name": "HaloPSA",
+            "config": halopsa_config,
+            "category": "Ticketing & PSA",
+            "check_type": "oauth",
+            "env_vars": []  # Basic is_configured check
+        },
+        {
+            "name": "Xero",
+            "config": xero_config,
+            "category": "Accounting",
+            "check_type": "oauth",
+            "env_vars": ["XERO_CLIENT_ID", "XERO_CLIENT_SECRET", "XERO_TENANT_ID", "XERO_REFRESH_TOKEN"]
+        },
+        {
+            "name": "SharePoint",
+            "config": sharepoint_config,
+            "category": "Document Management",
+            "check_type": "oauth",
+            "env_vars": ["SHAREPOINT_CLIENT_ID", "SHAREPOINT_CLIENT_SECRET", "SHAREPOINT_TENANT_ID", "SHAREPOINT_REFRESH_TOKEN"]
+        },
+        {
+            "name": "Front",
+            "config": front_config,
+            "category": "Email & Communications",
+            "check_type": "api_key",
+            "env_vars": []
+        },
+        {
+            "name": "Quoter",
+            "config": quoter_config,
+            "category": "Quoting",
+            "check_type": "oauth",
+            "env_vars": []
+        },
+        {
+            "name": "Pax8",
+            "config": pax8_config,
+            "category": "Cloud Marketplace",
+            "check_type": "oauth",
+            "env_vars": ["PAX8_CLIENT_ID", "PAX8_CLIENT_SECRET"]
+        },
+        {
+            "name": "BigQuery",
+            "config": bigquery_config,
+            "category": "Data Warehouse",
+            "check_type": "bigquery",
+            "env_vars": ["BIGQUERY_PROJECT_ID"]
+        },
+        {
+            "name": "FortiCloud",
+            "config": forticloud_config,
+            "category": "Network Security",
+            "check_type": "oauth",
+            "env_vars": ["FORTICLOUD_API_KEY", "FORTICLOUD_API_SECRET"]
+        },
+        {
+            "name": "Maxotel",
+            "config": maxotel_config,
+            "category": "VoIP",
+            "check_type": "api_key",
+            "env_vars": ["MAXOTEL_USERNAME", "MAXOTEL_API_KEY"]
+        },
+        {
+            "name": "Ubuntu Server",
+            "config": ubuntu_config,
+            "category": "Remote Server",
+            "check_type": "ssh_ubuntu",
+            "env_vars": ["UBUNTU_HOSTNAME", "UBUNTU_USERNAME"],
+            "auth_env_vars": ["UBUNTU_PASSWORD", "UBUNTU_PRIVATE_KEY"]
+        },
+        {
+            "name": "Vision Radiology",
+            "config": visionrad_config,
+            "category": "Remote Server",
+            "check_type": "ssh_visionrad",
+            "env_vars": ["VISIONRAD_HOSTNAME", "VISIONRAD_USERNAME"],
+            "auth_env_vars": ["VISIONRAD_PASSWORD", "VISIONRAD_PRIVATE_KEY"]
+        },
+    ]
 
-        # Build status checks for each service
-        services = []
+    async def check_platform_status(platform: dict) -> tuple:
+        """
+        Check the status of a platform and return (name, status, message, category).
+        This is called by the status page to check each platform dynamically.
+        """
+        name = platform["name"]
+        config = platform["config"]
+        category = platform["category"]
+        check_type = platform["check_type"]
+        env_vars = platform.get("env_vars", [])
+        auth_env_vars = platform.get("auth_env_vars", [])
 
-        # HaloPSA
-        if halopsa_config.is_configured:
-            try:
-                await halopsa_config.get_access_token()
-                services.append(("HaloPSA", "ok", "Connected", "Ticketing & PSA"))
-            except Exception as e:
-                services.append(("HaloPSA", "error", f"Auth failed: {str(e)[:40]}", "Ticketing & PSA"))
-        else:
-            services.append(("HaloPSA", "warning", "Not configured", "Ticketing & PSA"))
-
-        # Xero
-        if xero_config.is_configured:
-            try:
-                await xero_config.get_access_token()
-                services.append(("Xero", "ok", "Connected", "Accounting"))
-            except Exception as e:
-                services.append(("Xero", "error", f"Auth failed: {str(e)[:40]}", "Accounting"))
-        else:
+        if not config.is_configured:
+            # Build missing env vars message
             missing = []
-            if not os.getenv("XERO_CLIENT_ID"): missing.append("CLIENT_ID")
-            if not os.getenv("XERO_CLIENT_SECRET"): missing.append("CLIENT_SECRET")
-            if not os.getenv("XERO_TENANT_ID"): missing.append("TENANT_ID")
-            if not os.getenv("XERO_REFRESH_TOKEN"): missing.append("REFRESH_TOKEN")
-            services.append(("Xero", "warning", f"Missing: {', '.join(missing)}" if missing else "Not configured", "Accounting"))
+            for var in env_vars:
+                if not os.getenv(var):
+                    # Extract friendly name (last part after underscore)
+                    friendly = var.split("_")[-1] if "_" in var else var
+                    missing.append(friendly)
+            # Check auth vars (need at least one)
+            if auth_env_vars and not any(os.getenv(v) for v in auth_env_vars):
+                missing.append("AUTH")
 
-        # SharePoint
-        if sharepoint_config.is_configured:
-            try:
-                await sharepoint_config.get_access_token()
-                services.append(("SharePoint", "ok", "Connected", "Document Management"))
-            except Exception as e:
-                services.append(("SharePoint", "error", f"Auth failed: {str(e)[:40]}", "Document Management"))
-        else:
-            missing = []
-            if not os.getenv("SHAREPOINT_CLIENT_ID"): missing.append("CLIENT_ID")
-            if not os.getenv("SHAREPOINT_CLIENT_SECRET"): missing.append("CLIENT_SECRET")
-            if not os.getenv("SHAREPOINT_TENANT_ID"): missing.append("TENANT_ID")
-            if not os.getenv("SHAREPOINT_REFRESH_TOKEN"): missing.append("REFRESH_TOKEN")
-            services.append(("SharePoint", "warning", f"Missing: {', '.join(missing)}" if missing else "Not configured", "Document Management"))
+            msg = f"Missing: {', '.join(missing)}" if missing else "Not configured"
+            return (name, "warning", msg, category)
 
-        # Front
-        if front_config.is_configured:
-            services.append(("Front", "ok", "Configured", "Email & Communications"))
-        else:
-            services.append(("Front", "warning", "Not configured", "Email & Communications"))
+        # Platform is configured, now check connectivity
+        try:
+            if check_type == "oauth":
+                await config.get_access_token()
+                # Add extra info for FortiCloud
+                if name == "FortiCloud" and hasattr(config, 'client_id'):
+                    return (name, "ok", f"Connected ({config.client_id})", category)
+                return (name, "ok", "Connected", category)
 
-        # Quoter
-        if quoter_config.is_configured:
-            try:
-                await quoter_config.get_access_token()
-                services.append(("Quoter", "ok", "Connected", "Quoting"))
-            except Exception as e:
-                services.append(("Quoter", "error", f"Auth failed: {str(e)[:40]}", "Quoting"))
-        else:
-            services.append(("Quoter", "warning", "Not configured", "Quoting"))
+            elif check_type == "api_key":
+                return (name, "ok", "Configured", category)
 
-        # Pax8
-        if pax8_config.is_configured:
-            try:
-                await pax8_config.get_access_token()
-                services.append(("Pax8", "ok", "Connected", "Cloud Marketplace"))
-            except Exception as e:
-                services.append(("Pax8", "error", f"Auth failed: {str(e)[:40]}", "Cloud Marketplace"))
-        else:
-            missing = []
-            if not os.getenv("PAX8_CLIENT_ID"): missing.append("CLIENT_ID")
-            if not os.getenv("PAX8_CLIENT_SECRET"): missing.append("CLIENT_SECRET")
-            services.append(("Pax8", "warning", f"Missing: {', '.join(missing)}" if missing else "Not configured", "Cloud Marketplace"))
-
-        # BigQuery
-        if bigquery_config.is_configured:
-            try:
-                client = bigquery_config.get_client()
+            elif check_type == "bigquery":
+                client = config.get_client()
                 list(client.list_datasets(max_results=1))
-                job_info = f" (jobs: {bigquery_config.job_project_id})" if bigquery_config.job_project_id != bigquery_config.project_id else ""
-                services.append(("BigQuery", "ok", f"Connected to {bigquery_config.project_id}{job_info}", "Data Warehouse"))
-            except Exception as e:
-                services.append(("BigQuery", "error", f"Error: {str(e)[:40]}", "Data Warehouse"))
-        else:
-            services.append(("BigQuery", "warning", "Missing: BIGQUERY_PROJECT_ID", "Data Warehouse"))
+                job_info = f" (jobs: {config.job_project_id})" if config.job_project_id != config.project_id else ""
+                return (name, "ok", f"Connected to {config.project_id}{job_info}", category)
 
-        # FortiCloud
-        if forticloud_config.is_configured:
-            try:
-                await forticloud_config.get_access_token()
-                services.append(("FortiCloud", "ok", f"Connected ({forticloud_config.client_id})", "Network Security"))
-            except Exception as e:
-                services.append(("FortiCloud", "error", f"Auth failed: {str(e)[:40]}", "Network Security"))
-        else:
-            missing = []
-            if not os.getenv("FORTICLOUD_API_KEY"): missing.append("API_KEY")
-            if not os.getenv("FORTICLOUD_API_SECRET"): missing.append("API_SECRET")
-            services.append(("FortiCloud", "warning", f"Missing: {', '.join(missing)}" if missing else "Not configured", "Network Security"))
-
-        # Maxotel
-        if maxotel_config.is_configured:
-            services.append(("Maxotel", "ok", "Configured", "VoIP"))
-        else:
-            missing = []
-            if not os.getenv("MAXOTEL_USERNAME"): missing.append("USERNAME")
-            if not os.getenv("MAXOTEL_API_KEY"): missing.append("API_KEY")
-            services.append(("Maxotel", "warning", f"Missing: {', '.join(missing)}" if missing else "Not configured", "VoIP"))
-
-        # Ubuntu Server
-        if ubuntu_config.is_configured:
-            try:
+            elif check_type == "ssh_ubuntu":
                 import asyncssh
                 async with await _get_ssh_connection() as conn:
                     result = await conn.run("hostname", check=False)
                     hostname = result.stdout.strip() if result.exit_status == 0 else "unknown"
-                services.append((f"Ubuntu ({ubuntu_config.server_name})", "ok", f"Connected to {hostname}", "Remote Server"))
-            except Exception as e:
-                services.append((f"Ubuntu ({ubuntu_config.server_name})", "error", f"SSH failed: {str(e)[:40]}", "Remote Server"))
-        else:
-            missing = []
-            if not os.getenv("UBUNTU_HOSTNAME"): missing.append("HOSTNAME")
-            if not os.getenv("UBUNTU_USERNAME"): missing.append("USERNAME")
-            if not os.getenv("UBUNTU_PASSWORD") and not os.getenv("UBUNTU_PRIVATE_KEY"): missing.append("AUTH")
-            services.append(("Ubuntu Server", "warning", f"Missing: {', '.join(missing)}" if missing else "Not configured", "Remote Server"))
+                display_name = f"Ubuntu ({config.server_name})" if hasattr(config, 'server_name') else name
+                return (display_name, "ok", f"Connected to {hostname}", category)
+
+            elif check_type == "ssh_visionrad":
+                import asyncssh
+                async with await _get_visionrad_ssh_connection() as conn:
+                    result = await conn.run("hostname", check=False)
+                    hostname = result.stdout.strip() if result.exit_status == 0 else "unknown"
+                display_name = f"Vision Radiology ({config.server_name})" if hasattr(config, 'server_name') else name
+                return (display_name, "ok", f"Connected to {hostname}", category)
+
+            else:
+                return (name, "warning", f"Unknown check type: {check_type}", category)
+
+        except Exception as e:
+            error_msg = str(e)[:40]
+            if check_type in ("ssh_ubuntu", "ssh_visionrad"):
+                display_name = f"{name} ({config.server_name})" if hasattr(config, 'server_name') else name
+                return (display_name, "error", f"SSH failed: {error_msg}", category)
+            return (name, "error", f"Auth failed: {error_msg}", category)
+
+    async def status_page_route(request):
+        """Web-based status page showing all service integrations.
+
+        Platforms are automatically discovered from PLATFORM_REGISTRY.
+        To add a new platform, simply add an entry to the registry above.
+        """
+        from datetime import datetime
+
+        check_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
+
+        # Build status checks dynamically from registry
+        services = []
+        for platform in PLATFORM_REGISTRY:
+            status_tuple = await check_platform_status(platform)
+            services.append(status_tuple)
 
         # Count statuses
         ok_count = sum(1 for s in services if s[1] == "ok")
