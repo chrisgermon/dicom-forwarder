@@ -7712,6 +7712,555 @@ async def ubuntu_docker_manage(
 
 
 # ============================================================================
+# Vision Radiology Server Integration (SSH)
+# ============================================================================
+
+class VisionRadConfig:
+    """Vision Radiology GCP server SSH configuration for BigQuery sync operations."""
+    def __init__(self):
+        self.hostname = os.getenv("VISIONRAD_HOSTNAME", "")
+        self.port = int(os.getenv("VISIONRAD_PORT", "22"))
+        self.username = os.getenv("VISIONRAD_USERNAME", "")
+        self.password = os.getenv("VISIONRAD_PASSWORD", "")
+        # SSH private key (base64 encoded or direct key content)
+        self._private_key = os.getenv("VISIONRAD_PRIVATE_KEY", "")
+        # Optional: path to private key file in Secret Manager
+        self._private_key_secret = os.getenv("VISIONRAD_PRIVATE_KEY_SECRET", "")
+        # Known hosts verification (disable for self-signed/unknown hosts)
+        self.verify_host = os.getenv("VISIONRAD_VERIFY_HOST", "false").lower() == "true"
+        # Connection timeout
+        self.timeout = int(os.getenv("VISIONRAD_TIMEOUT", "30"))
+        # Friendly name for this server
+        self.server_name = os.getenv("VISIONRAD_SERVER_NAME", "Vision Radiology BigQuery Sync")
+
+    @property
+    def is_configured(self) -> bool:
+        """Check if minimum SSH configuration is available."""
+        has_auth = bool(self.password) or bool(self._private_key) or bool(self._private_key_secret)
+        return bool(self.hostname) and bool(self.username) and has_auth
+
+    def get_private_key(self) -> Optional[str]:
+        """Get the SSH private key, loading from Secret Manager if needed."""
+        if self._private_key:
+            # Check if base64 encoded
+            import base64
+            try:
+                decoded = base64.b64decode(self._private_key).decode('utf-8')
+                if decoded.startswith('-----BEGIN'):
+                    return decoded
+            except Exception:
+                pass
+            # Return as-is if not base64 or already plain text
+            if self._private_key.startswith('-----BEGIN'):
+                return self._private_key
+            return None
+
+        if self._private_key_secret:
+            secret_value = get_secret_sync(self._private_key_secret)
+            if secret_value:
+                return secret_value
+
+        return None
+
+visionrad_config = VisionRadConfig()
+
+
+async def _get_visionrad_ssh_connection():
+    """Create an SSH connection to the Vision Radiology server."""
+    import asyncssh
+
+    connect_kwargs = {
+        "host": visionrad_config.hostname,
+        "port": visionrad_config.port,
+        "username": visionrad_config.username,
+        "connect_timeout": visionrad_config.timeout,
+    }
+
+    # Add authentication
+    private_key = visionrad_config.get_private_key()
+    if private_key:
+        connect_kwargs["client_keys"] = [asyncssh.import_private_key(private_key)]
+    elif visionrad_config.password:
+        connect_kwargs["password"] = visionrad_config.password
+
+    # Host key verification
+    if not visionrad_config.verify_host:
+        connect_kwargs["known_hosts"] = None
+
+    return await asyncssh.connect(**connect_kwargs)
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True})
+async def visionrad_execute_command(
+    command: str = Field(..., description="The shell command to execute on the Vision Radiology server"),
+    timeout: int = Field(60, description="Command timeout in seconds (max 300)"),
+    working_directory: Optional[str] = Field(None, description="Directory to run the command in")
+) -> str:
+    """
+    Execute a shell command on the Vision Radiology BigQuery Sync server via SSH.
+
+    This server runs in the Vision Radiology GCP environment (australia-southeast2-a)
+    and handles BigQuery data synchronization tasks.
+
+    Security: This tool has full shell access. Use with caution.
+    """
+    if not visionrad_config.is_configured:
+        return "Error: Vision Radiology server not configured. Set VISIONRAD_HOSTNAME, VISIONRAD_USERNAME, and VISIONRAD_PASSWORD or VISIONRAD_PRIVATE_KEY."
+
+    try:
+        import asyncssh
+
+        timeout = min(max(1, timeout), 300)  # Clamp between 1-300 seconds
+
+        # Prepend cd if working directory specified
+        if working_directory:
+            command = f"cd {working_directory} && {command}"
+
+        async with await _get_visionrad_ssh_connection() as conn:
+            result = await asyncio.wait_for(
+                conn.run(command, check=False),
+                timeout=timeout
+            )
+
+            output_parts = []
+
+            if result.stdout:
+                output_parts.append(f"**STDOUT:**\n```\n{result.stdout.strip()}\n```")
+
+            if result.stderr:
+                output_parts.append(f"**STDERR:**\n```\n{result.stderr.strip()}\n```")
+
+            exit_status = f"**Exit Code:** {result.exit_status}"
+
+            if not output_parts:
+                output_parts.append("*(No output)*")
+
+            return f"# Command Executed on {visionrad_config.server_name}\n\n**Command:** `{command}`\n\n{exit_status}\n\n" + "\n\n".join(output_parts)
+
+    except asyncio.TimeoutError:
+        return f"Error: Command timed out after {timeout} seconds."
+    except asyncssh.Error as e:
+        logger.error(f"VisionRad SSH error: {e}")
+        return f"SSH Error: {str(e)}"
+    except Exception as e:
+        logger.error(f"VisionRad execute command error: {e}")
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def visionrad_read_file(
+    file_path: str = Field(..., description="Absolute path to the file to read"),
+    max_lines: int = Field(500, description="Maximum number of lines to return (default 500, max 2000)"),
+    encoding: str = Field("utf-8", description="File encoding (default utf-8)")
+) -> str:
+    """
+    Read the contents of a file from the Vision Radiology server.
+    Large files are truncated to max_lines.
+
+    Common paths:
+    - BigQuery sync scripts and queries
+    - Configuration files
+    - Log files
+    """
+    if not visionrad_config.is_configured:
+        return "Error: Vision Radiology server not configured."
+
+    try:
+        import asyncssh
+
+        max_lines = min(max(1, max_lines), 2000)
+
+        async with await _get_visionrad_ssh_connection() as conn:
+            # Check file exists and get info
+            check_result = await conn.run(f"stat '{file_path}' 2>&1", check=False)
+            if check_result.exit_status != 0:
+                return f"Error: File not found or not accessible: {file_path}\n\n{check_result.stdout}"
+
+            # Read file with head to limit output
+            result = await conn.run(f"head -n {max_lines} '{file_path}'", check=False)
+
+            if result.exit_status != 0:
+                return f"Error reading file: {result.stderr}"
+
+            content = result.stdout
+
+            # Check if file was truncated
+            wc_result = await conn.run(f"wc -l < '{file_path}'", check=False)
+            total_lines = int(wc_result.stdout.strip()) if wc_result.exit_status == 0 else 0
+
+            truncated_notice = ""
+            if total_lines > max_lines:
+                truncated_notice = f"\n\n**(Showing {max_lines} of {total_lines} lines)**"
+
+            return f"# File: {file_path}\n\n```\n{content}\n```{truncated_notice}"
+
+    except asyncssh.Error as e:
+        logger.error(f"VisionRad SSH error: {e}")
+        return f"SSH Error: {str(e)}"
+    except Exception as e:
+        logger.error(f"VisionRad read file error: {e}")
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True})
+async def visionrad_write_file(
+    file_path: str = Field(..., description="Absolute path to the file to write"),
+    content: str = Field(..., description="The content to write to the file"),
+    append: bool = Field(False, description="If true, append to file instead of overwriting"),
+    create_dirs: bool = Field(False, description="If true, create parent directories if they don't exist"),
+    mode: Optional[str] = Field(None, description="Optional chmod mode (e.g., '755', '644')")
+) -> str:
+    """
+    Write content to a file on the Vision Radiology server.
+
+    Use this to update:
+    - BigQuery sync queries
+    - Configuration files
+    - Scripts
+
+    WARNING: This will overwrite existing files unless append=True.
+    """
+    if not visionrad_config.is_configured:
+        return "Error: Vision Radiology server not configured."
+
+    try:
+        import asyncssh
+
+        async with await _get_visionrad_ssh_connection() as conn:
+            # Create parent directories if requested
+            if create_dirs:
+                import os
+                parent_dir = os.path.dirname(file_path)
+                if parent_dir:
+                    await conn.run(f"mkdir -p '{parent_dir}'", check=False)
+
+            # Write content using heredoc
+            operator = ">>" if append else ">"
+            # Escape content for shell
+            escaped_content = content.replace("'", "'\"'\"'")
+            write_command = f"cat <<'VISIONRAD_EOF' {operator} '{file_path}'\n{content}\nVISIONRAD_EOF"
+
+            result = await conn.run(write_command, check=False)
+
+            if result.exit_status != 0:
+                return f"Error writing file: {result.stderr}"
+
+            # Apply chmod if specified
+            if mode:
+                chmod_result = await conn.run(f"chmod {mode} '{file_path}'", check=False)
+                if chmod_result.exit_status != 0:
+                    return f"File written but chmod failed: {chmod_result.stderr}"
+
+            action = "appended to" if append else "written to"
+            mode_info = f" (mode: {mode})" if mode else ""
+            return f"# File {action.title()}\n\n**Path:** {file_path}\n**Action:** {action}{mode_info}\n**Size:** {len(content)} bytes"
+
+    except asyncssh.Error as e:
+        logger.error(f"VisionRad SSH error: {e}")
+        return f"SSH Error: {str(e)}"
+    except Exception as e:
+        logger.error(f"VisionRad write file error: {e}")
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def visionrad_list_directory(
+    directory: str = Field(..., description="Directory path to list"),
+    all_files: bool = Field(False, description="Include hidden files (ls -a)"),
+    long_format: bool = Field(True, description="Use long format with details (ls -l)"),
+    recursive: bool = Field(False, description="List recursively (be careful with large directories)")
+) -> str:
+    """
+    List directory contents on the Vision Radiology server.
+
+    Useful for exploring:
+    - Script locations
+    - Query file directories
+    - Log directories
+    """
+    if not visionrad_config.is_configured:
+        return "Error: Vision Radiology server not configured."
+
+    try:
+        import asyncssh
+
+        flags = []
+        if long_format:
+            flags.append("-l")
+        if all_files:
+            flags.append("-a")
+        if recursive:
+            flags.append("-R")
+
+        flags_str = " ".join(flags) if flags else ""
+
+        async with await _get_visionrad_ssh_connection() as conn:
+            result = await conn.run(f"ls {flags_str} '{directory}' 2>&1", check=False)
+
+            if result.exit_status != 0:
+                return f"Error listing directory: {result.stdout}"
+
+            return f"# Directory: {directory}\n\n```\n{result.stdout.strip()}\n```"
+
+    except asyncssh.Error as e:
+        logger.error(f"VisionRad SSH error: {e}")
+        return f"SSH Error: {str(e)}"
+    except Exception as e:
+        logger.error(f"VisionRad list directory error: {e}")
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def visionrad_system_info() -> str:
+    """
+    Get system information from the Vision Radiology server.
+
+    Returns: OS info, memory usage, disk space, CPU load, uptime, and network info.
+    """
+    if not visionrad_config.is_configured:
+        return "Error: Vision Radiology server not configured."
+
+    try:
+        import asyncssh
+
+        async with await _get_visionrad_ssh_connection() as conn:
+            info_parts = []
+
+            # Hostname and OS
+            hostname_result = await conn.run("hostname", check=False)
+            os_result = await conn.run("cat /etc/os-release 2>/dev/null | grep PRETTY_NAME | cut -d= -f2 | tr -d '\"'", check=False)
+
+            info_parts.append(f"**Hostname:** {hostname_result.stdout.strip()}")
+            info_parts.append(f"**OS:** {os_result.stdout.strip()}")
+
+            # Uptime
+            uptime_result = await conn.run("uptime -p 2>/dev/null || uptime", check=False)
+            info_parts.append(f"**Uptime:** {uptime_result.stdout.strip()}")
+
+            # Memory
+            mem_result = await conn.run("free -h | grep Mem | awk '{print $3 \"/\" $2 \" (\" int($3/$2*100) \"% used)\"}'", check=False)
+            info_parts.append(f"**Memory:** {mem_result.stdout.strip()}")
+
+            # Disk
+            disk_result = await conn.run("df -h / | tail -1 | awk '{print $3 \"/\" $2 \" (\" $5 \" used)\"}'", check=False)
+            info_parts.append(f"**Disk (/):** {disk_result.stdout.strip()}")
+
+            # CPU load
+            load_result = await conn.run("cat /proc/loadavg | awk '{print $1 \", \" $2 \", \" $3}'", check=False)
+            info_parts.append(f"**Load Average:** {load_result.stdout.strip()}")
+
+            # IP addresses
+            ip_result = await conn.run("hostname -I 2>/dev/null | awk '{print $1}'", check=False)
+            info_parts.append(f"**Internal IP:** {ip_result.stdout.strip()}")
+
+            return f"# {visionrad_config.server_name} System Info\n\n" + "\n".join(info_parts)
+
+    except asyncssh.Error as e:
+        logger.error(f"VisionRad SSH error: {e}")
+        return f"SSH Error: {str(e)}"
+    except Exception as e:
+        logger.error(f"VisionRad system info error: {e}")
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def visionrad_service_status(
+    service_name: str = Field(..., description="Name of the systemd service to check")
+) -> str:
+    """
+    Check the status of a systemd service on the Vision Radiology server.
+
+    Common services to check:
+    - cron (scheduled sync jobs)
+    - docker (if using containers)
+    - Any custom BigQuery sync services
+    """
+    if not visionrad_config.is_configured:
+        return "Error: Vision Radiology server not configured."
+
+    try:
+        import asyncssh
+
+        async with await _get_visionrad_ssh_connection() as conn:
+            result = await conn.run(f"systemctl status {service_name} 2>&1", check=False)
+
+            # Get active state
+            active_result = await conn.run(f"systemctl is-active {service_name} 2>&1", check=False)
+            active_state = active_result.stdout.strip()
+
+            # Get enabled state
+            enabled_result = await conn.run(f"systemctl is-enabled {service_name} 2>&1", check=False)
+            enabled_state = enabled_result.stdout.strip()
+
+            status_emoji = "✅" if active_state == "active" else "❌" if active_state == "failed" else "⚠️"
+
+            return f"# Service: {service_name}\n\n{status_emoji} **State:** {active_state}\n**Enabled:** {enabled_state}\n\n```\n{result.stdout.strip()}\n```"
+
+    except asyncssh.Error as e:
+        logger.error(f"VisionRad SSH error: {e}")
+        return f"SSH Error: {str(e)}"
+    except Exception as e:
+        logger.error(f"VisionRad service status error: {e}")
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True, "openWorldHint": True})
+async def visionrad_manage_service(
+    service_name: str = Field(..., description="Name of the systemd service to manage"),
+    action: str = Field(..., description="Action: start, stop, restart, reload, enable, disable")
+) -> str:
+    """
+    Manage a systemd service on the Vision Radiology server.
+
+    Actions:
+    - start: Start the service
+    - stop: Stop the service
+    - restart: Restart the service
+    - reload: Reload service configuration
+    - enable: Enable service to start on boot
+    - disable: Disable service from starting on boot
+    """
+    if not visionrad_config.is_configured:
+        return "Error: Vision Radiology server not configured."
+
+    valid_actions = ["start", "stop", "restart", "reload", "enable", "disable"]
+    if action.lower() not in valid_actions:
+        return f"Error: Invalid action '{action}'. Valid actions: {', '.join(valid_actions)}"
+
+    try:
+        import asyncssh
+
+        async with await _get_visionrad_ssh_connection() as conn:
+            # Execute the systemctl command
+            result = await conn.run(f"sudo systemctl {action.lower()} {service_name} 2>&1", check=False)
+
+            if result.exit_status != 0:
+                return f"Error managing service: {result.stdout}\n{result.stderr}"
+
+            # Get new status
+            status_result = await conn.run(f"systemctl is-active {service_name} 2>&1", check=False)
+            new_state = status_result.stdout.strip()
+
+            status_emoji = "✅" if new_state == "active" else "❌" if new_state == "failed" else "⚠️"
+
+            return f"# Service Action\n\n**Service:** {service_name}\n**Action:** {action}\n{status_emoji} **Current State:** {new_state}"
+
+    except asyncssh.Error as e:
+        logger.error(f"VisionRad SSH error: {e}")
+        return f"SSH Error: {str(e)}"
+    except Exception as e:
+        logger.error(f"VisionRad manage service error: {e}")
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def visionrad_bigquery_sync_status() -> str:
+    """
+    Check the status of BigQuery synchronization tasks on the Vision Radiology server.
+
+    This checks:
+    - Sync script locations
+    - Recent sync logs
+    - Cron jobs related to BigQuery
+    - Any running sync processes
+    """
+    if not visionrad_config.is_configured:
+        return "Error: Vision Radiology server not configured."
+
+    try:
+        import asyncssh
+
+        async with await _get_visionrad_ssh_connection() as conn:
+            info_parts = []
+
+            # Check for cron jobs related to bigquery/sync
+            cron_result = await conn.run("crontab -l 2>/dev/null | grep -i -E '(bigquery|sync|bq)' || echo 'No BigQuery cron jobs found'", check=False)
+            info_parts.append(f"**Scheduled Jobs:**\n```\n{cron_result.stdout.strip()}\n```")
+
+            # Check for running sync processes
+            ps_result = await conn.run("ps aux | grep -i -E '(bigquery|bq|sync)' | grep -v grep || echo 'No sync processes running'", check=False)
+            info_parts.append(f"**Running Processes:**\n```\n{ps_result.stdout.strip()}\n```")
+
+            # Look for common sync script locations
+            script_locations = ["/opt/bigquery", "/home/*/bigquery", "/usr/local/bin/*bq*", "/var/scripts"]
+            for loc in script_locations:
+                find_result = await conn.run(f"ls -la {loc} 2>/dev/null | head -20", check=False)
+                if find_result.exit_status == 0 and find_result.stdout.strip():
+                    info_parts.append(f"**Scripts in {loc}:**\n```\n{find_result.stdout.strip()}\n```")
+
+            # Check for recent log files
+            log_result = await conn.run("ls -lt /var/log/*sync* /var/log/*bigquery* 2>/dev/null | head -5 || echo 'No sync log files found'", check=False)
+            info_parts.append(f"**Recent Log Files:**\n```\n{log_result.stdout.strip()}\n```")
+
+            return f"# {visionrad_config.server_name} - BigQuery Sync Status\n\n" + "\n\n".join(info_parts)
+
+    except asyncssh.Error as e:
+        logger.error(f"VisionRad SSH error: {e}")
+        return f"SSH Error: {str(e)}"
+    except Exception as e:
+        logger.error(f"VisionRad bigquery sync status error: {e}")
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def visionrad_search_files(
+    directory: str = Field(..., description="Directory to search in"),
+    pattern: str = Field(..., description="Search pattern (grep regex or filename glob)"),
+    search_type: str = Field("content", description="Search type: 'content' (grep in files) or 'name' (find by filename)"),
+    file_pattern: str = Field("*", description="File glob pattern to filter (e.g., '*.sql', '*.py')")
+) -> str:
+    """
+    Search for files or content on the Vision Radiology server.
+
+    Useful for finding:
+    - SQL queries containing specific tables/columns
+    - Configuration values
+    - Scripts with specific functionality
+    """
+    if not visionrad_config.is_configured:
+        return "Error: Vision Radiology server not configured."
+
+    try:
+        import asyncssh
+
+        async with await _get_visionrad_ssh_connection() as conn:
+            if search_type == "content":
+                # Search file contents with grep
+                cmd = f"grep -r -n -l '{pattern}' {directory} --include='{file_pattern}' 2>/dev/null | head -50"
+                result = await conn.run(cmd, check=False)
+
+                if not result.stdout.strip():
+                    return f"No files found containing '{pattern}' in {directory}"
+
+                # Also show context
+                files = result.stdout.strip().split('\n')[:10]  # Limit to first 10 files
+                context_parts = []
+                for f in files:
+                    ctx_result = await conn.run(f"grep -n '{pattern}' '{f}' | head -3", check=False)
+                    if ctx_result.stdout.strip():
+                        context_parts.append(f"**{f}:**\n```\n{ctx_result.stdout.strip()}\n```")
+
+                return f"# Search Results for '{pattern}'\n\n**Directory:** {directory}\n**Files Found:** {len(files)}\n\n" + "\n\n".join(context_parts)
+
+            else:
+                # Search by filename
+                cmd = f"find {directory} -name '{pattern}' -type f 2>/dev/null | head -50"
+                result = await conn.run(cmd, check=False)
+
+                if not result.stdout.strip():
+                    return f"No files found matching '{pattern}' in {directory}"
+
+                return f"# Files Matching '{pattern}'\n\n**Directory:** {directory}\n\n```\n{result.stdout.strip()}\n```"
+
+    except asyncssh.Error as e:
+        logger.error(f"VisionRad SSH error: {e}")
+        return f"SSH Error: {str(e)}"
+    except Exception as e:
+        logger.error(f"VisionRad search files error: {e}")
+        return f"Error: {str(e)}"
+
+
+# ============================================================================
 # Server Status
 # ============================================================================
 
@@ -7844,6 +8393,26 @@ async def server_status() -> str:
         if not os.getenv("UBUNTU_PASSWORD") and not os.getenv("UBUNTU_PRIVATE_KEY"):
             missing.append("PASSWORD or PRIVATE_KEY")
         lines.append(f"⚠️ **Ubuntu Server:** Missing: {', '.join(missing)}")
+
+    # Vision Radiology Server (SSH) status
+    if visionrad_config.is_configured:
+        try:
+            import asyncssh
+            async with await _get_visionrad_ssh_connection() as conn:
+                result = await conn.run("hostname", check=False)
+                hostname = result.stdout.strip() if result.exit_status == 0 else "unknown"
+            lines.append(f"✅ **Vision Radiology ({visionrad_config.server_name}):** Connected to {hostname}")
+        except Exception as e:
+            lines.append(f"❌ **Vision Radiology ({visionrad_config.server_name}):** SSH failed - {str(e)[:50]}")
+    else:
+        missing = []
+        if not os.getenv("VISIONRAD_HOSTNAME"):
+            missing.append("HOSTNAME")
+        if not os.getenv("VISIONRAD_USERNAME"):
+            missing.append("USERNAME")
+        if not os.getenv("VISIONRAD_PASSWORD") and not os.getenv("VISIONRAD_PRIVATE_KEY"):
+            missing.append("PASSWORD or PRIVATE_KEY")
+        lines.append(f"⚠️ **Vision Radiology Server:** Missing: {', '.join(missing)}")
 
     lines.append(f"\n**Cloud Run URL:** {CLOUD_RUN_URL}")
     return "\n".join(lines)
