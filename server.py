@@ -5877,6 +5877,286 @@ async def bigquery_sample_data(
 
 
 # ============================================================================
+# AWS RDS Integration (MySQL via SSH tunnel)
+# ============================================================================
+
+class RDSConfig:
+    """AWS RDS MySQL configuration.
+
+    Assumes connection through an SSH tunnel to localhost:3306.
+
+    Environment variables:
+    - RDS_HOST: Database host (default: 127.0.0.1 for SSH tunnel)
+    - RDS_PORT: Database port (default: 3306)
+    - RDS_USERNAME: Database username
+    - RDS_PASSWORD: Database password
+    - RDS_DEFAULT_DATABASE: Default database to connect to (optional)
+    """
+
+    def __init__(self):
+        self.host = os.getenv("RDS_HOST", "127.0.0.1")
+        self.port = int(os.getenv("RDS_PORT", "3306"))
+        self.username = os.getenv("RDS_USERNAME", "")
+        self.password = os.getenv("RDS_PASSWORD", "")
+        self.default_database = os.getenv("RDS_DEFAULT_DATABASE", "")
+        self.charset = "utf8mb4"
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.username) and bool(self.password)
+
+    def get_connection(self, database: str = None):
+        """Get a connection to AWS RDS."""
+        import pymysql
+
+        config = {
+            "host": self.host,
+            "port": self.port,
+            "user": self.username,
+            "password": self.password,
+            "charset": self.charset,
+        }
+        if database:
+            config["database"] = database
+        elif self.default_database:
+            config["database"] = self.default_database
+
+        return pymysql.connect(**config)
+
+
+rds_config = RDSConfig()
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def aws_rds_list_databases() -> str:
+    """
+    List all databases in AWS RDS.
+
+    Returns a list of all available databases on the RDS instance.
+    """
+    if not rds_config.is_configured:
+        return "Error: AWS RDS is not configured. Set RDS_USERNAME and RDS_PASSWORD environment variables."
+
+    try:
+        conn = rds_config.get_connection()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SHOW DATABASES")
+                databases = [row[0] for row in cur.fetchall()]
+
+                output = ["# AWS RDS Databases", ""]
+                for db in databases:
+                    output.append(f"- {db}")
+                output.append("")
+                output.append(f"Total: {len(databases)} database(s)")
+                return "\n".join(output)
+        finally:
+            conn.close()
+    except ImportError:
+        return "Error: pymysql package not installed."
+    except Exception as e:
+        logger.error(f"AWS RDS list databases error: {e}")
+        return f"AWS RDS error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def aws_rds_list_tables(
+    database: str = Field(..., description="Database name to list tables from")
+) -> str:
+    """
+    List all tables in a specific AWS RDS database.
+
+    Returns a list of all tables in the specified database.
+    """
+    if not rds_config.is_configured:
+        return "Error: AWS RDS is not configured. Set RDS_USERNAME and RDS_PASSWORD environment variables."
+
+    try:
+        conn = rds_config.get_connection(database)
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SHOW TABLES")
+                tables = [row[0] for row in cur.fetchall()]
+
+                output = [f"# Tables in `{database}`", ""]
+                for table in tables:
+                    output.append(f"- {table}")
+                output.append("")
+                output.append(f"Total: {len(tables)} table(s)")
+                return "\n".join(output)
+        finally:
+            conn.close()
+    except ImportError:
+        return "Error: pymysql package not installed."
+    except Exception as e:
+        logger.error(f"AWS RDS list tables error: {e}")
+        return f"AWS RDS error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def aws_rds_describe_table(
+    database: str = Field(..., description="Database name"),
+    table: str = Field(..., description="Table name to describe")
+) -> str:
+    """
+    Get the structure/schema of a table in AWS RDS.
+
+    Returns column definitions including field name, type, nullable, key, default, and extra info.
+    """
+    if not rds_config.is_configured:
+        return "Error: AWS RDS is not configured. Set RDS_USERNAME and RDS_PASSWORD environment variables."
+
+    try:
+        conn = rds_config.get_connection(database)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"DESCRIBE `{table}`")
+                columns = cur.fetchall()
+
+                output = [f"# Table Structure: `{database}`.`{table}`", ""]
+                output.append("| Field | Type | Null | Key | Default | Extra |")
+                output.append("|-------|------|------|-----|---------|-------|")
+
+                for col in columns:
+                    field = col[0] or ""
+                    col_type = col[1] or ""
+                    null = col[2] or ""
+                    key = col[3] or ""
+                    default = str(col[4]) if col[4] is not None else "NULL"
+                    extra = col[5] or ""
+                    output.append(f"| {field} | {col_type} | {null} | {key} | {default} | {extra} |")
+
+                output.append("")
+                output.append(f"Total: {len(columns)} column(s)")
+                return "\n".join(output)
+        finally:
+            conn.close()
+    except ImportError:
+        return "Error: pymysql package not installed."
+    except Exception as e:
+        logger.error(f"AWS RDS describe table error: {e}")
+        return f"AWS RDS error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def aws_rds_query(
+    database: str = Field(..., description="Database name"),
+    sql: str = Field(..., description="SQL SELECT query to execute"),
+    max_results: int = Field(100, description="Maximum number of rows to return (1-1000)")
+) -> str:
+    """
+    Execute a SELECT query on AWS RDS (read-only).
+
+    Only SELECT queries are allowed for security.
+    Returns results as a markdown table.
+    """
+    if not rds_config.is_configured:
+        return "Error: AWS RDS is not configured. Set RDS_USERNAME and RDS_PASSWORD environment variables."
+
+    # Security: Only allow SELECT queries
+    sql_upper = sql.strip().upper()
+    if not sql_upper.startswith("SELECT"):
+        return "Error: Only SELECT queries are allowed for security reasons."
+
+    max_results = min(max(1, max_results), 1000)
+
+    try:
+        conn = rds_config.get_connection(database)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                columns = [desc[0] for desc in cur.description]
+                rows = cur.fetchmany(max_results)
+
+                if not rows:
+                    return "Query returned no results."
+
+                # Format as markdown table
+                output = ["| " + " | ".join(columns) + " |"]
+                output.append("| " + " | ".join(["---"] * len(columns)) + " |")
+
+                for row in rows:
+                    formatted_row = []
+                    for val in row:
+                        if val is None:
+                            formatted_row.append("NULL")
+                        else:
+                            # Escape pipe characters and truncate long values
+                            str_val = str(val).replace("|", "\\|")
+                            if len(str_val) > 100:
+                                str_val = str_val[:97] + "..."
+                            formatted_row.append(str_val)
+                    output.append("| " + " | ".join(formatted_row) + " |")
+
+                output.append("")
+                output.append(f"Rows returned: {len(rows)}" + (f" (limited to {max_results})" if len(rows) == max_results else ""))
+                return "\n".join(output)
+        finally:
+            conn.close()
+    except ImportError:
+        return "Error: pymysql package not installed."
+    except Exception as e:
+        logger.error(f"AWS RDS query error: {e}")
+        return f"AWS RDS error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def aws_rds_sample_data(
+    database: str = Field(..., description="Database name"),
+    table: str = Field(..., description="Table name to sample from"),
+    limit: int = Field(10, description="Number of sample rows (1-100)")
+) -> str:
+    """
+    Get sample rows from a table in AWS RDS.
+
+    Quick way to preview table contents without writing SQL.
+    """
+    if not rds_config.is_configured:
+        return "Error: AWS RDS is not configured. Set RDS_USERNAME and RDS_PASSWORD environment variables."
+
+    limit = min(max(1, limit), 100)
+
+    try:
+        conn = rds_config.get_connection(database)
+        try:
+            with conn.cursor() as cur:
+                cur.execute(f"SELECT * FROM `{table}` LIMIT {limit}")
+                columns = [desc[0] for desc in cur.description]
+                rows = cur.fetchall()
+
+                if not rows:
+                    return f"Table `{database}`.`{table}` is empty."
+
+                # Format as markdown table
+                output = [f"# Sample Data: `{database}`.`{table}`", ""]
+                output.append("| " + " | ".join(columns) + " |")
+                output.append("| " + " | ".join(["---"] * len(columns)) + " |")
+
+                for row in rows:
+                    formatted_row = []
+                    for val in row:
+                        if val is None:
+                            formatted_row.append("NULL")
+                        else:
+                            str_val = str(val).replace("|", "\\|")
+                            if len(str_val) > 100:
+                                str_val = str_val[:97] + "..."
+                            formatted_row.append(str_val)
+                    output.append("| " + " | ".join(formatted_row) + " |")
+
+                output.append("")
+                output.append(f"Showing {len(rows)} row(s)")
+                return "\n".join(output)
+        finally:
+            conn.close()
+    except ImportError:
+        return "Error: pymysql package not installed."
+    except Exception as e:
+        logger.error(f"AWS RDS sample data error: {e}")
+        return f"AWS RDS error: {str(e)}"
+
+
+# ============================================================================
 # FortiCloud Integration (FortiGate Cloud, FortiManager, FortiAnalyzer, etc.)
 # ============================================================================
 
