@@ -10396,20 +10396,25 @@ if __name__ == "__main__":
         Returns dict with build name, time, status, and changes or None if not configured/accessible.
         """
         try:
+            import asyncio
             from google.cloud.devtools.cloudbuild_v1 import CloudBuildClient
             from google.cloud.devtools.cloudbuild_v1.types import ListBuildsRequest
 
             project_id = os.getenv("GCP_PROJECT_ID", os.getenv("GOOGLE_CLOUD_PROJECT", "crowdmcp"))
 
-            client = CloudBuildClient()
+            def _fetch_builds():
+                client = CloudBuildClient()
+                request = ListBuildsRequest(
+                    project_id=project_id,
+                    page_size=1,
+                )
+                return list(client.list_builds(request=request))
 
-            # List recent builds for this project
-            request = ListBuildsRequest(
-                project_id=project_id,
-                page_size=1,  # Only need the latest build
+            # Run synchronous Cloud Build API call in thread pool with timeout
+            builds = await asyncio.wait_for(
+                asyncio.to_thread(_fetch_builds),
+                timeout=10.0  # 10 second timeout
             )
-
-            builds = client.list_builds(request=request)
 
             for build in builds:
                 # Get build details
@@ -10459,6 +10464,9 @@ if __name__ == "__main__":
 
             return {"error": "No builds found", "project_id": project_id}
 
+        except asyncio.TimeoutError:
+            logger.warning("Cloud Build status check timed out after 10s")
+            return {"error": "Timeout fetching Cloud Build status", "project_id": os.getenv("GCP_PROJECT_ID", "crowdmcp")}
         except Exception as e:
             logger.error(f"Cloud Build status error: {e}")
             return {"error": str(e)}
@@ -10479,23 +10487,28 @@ if __name__ == "__main__":
         Use this to monitor deployments and check if new revisions have been deployed.
         """
         try:
+            import asyncio
             from google.cloud.devtools.cloudbuild_v1 import CloudBuildClient
             from google.cloud.devtools.cloudbuild_v1.types import ListBuildsRequest
 
             project_id = os.getenv("GCP_PROJECT_ID", os.getenv("GOOGLE_CLOUD_PROJECT", "crowdmcp"))
 
-            client = CloudBuildClient()
-
             # Limit to reasonable range
             limit = min(max(1, limit), 50)
 
-            # List recent builds for this project
-            request = ListBuildsRequest(
-                project_id=project_id,
-                page_size=limit,
-            )
+            def _fetch_builds():
+                client = CloudBuildClient()
+                request = ListBuildsRequest(
+                    project_id=project_id,
+                    page_size=limit,
+                )
+                return list(client.list_builds(request=request))
 
-            builds_response = client.list_builds(request=request)
+            # Run synchronous Cloud Build API call in thread pool with timeout
+            builds_response = await asyncio.wait_for(
+                asyncio.to_thread(_fetch_builds),
+                timeout=15.0  # 15 second timeout for potentially larger result set
+            )
 
             # Status mapping for filtering and display
             status_map = {
@@ -10610,6 +10623,9 @@ if __name__ == "__main__":
 
         except ImportError:
             return "Error: google-cloud-build package not installed. Run: pip install google-cloud-build"
+        except asyncio.TimeoutError:
+            logger.warning("Cloud Run deployments check timed out after 15s")
+            return "Error: Timeout fetching deployments from Cloud Build API"
         except Exception as e:
             logger.error(f"Cloud Run deployments error: {e}")
             return f"Error fetching deployments: {str(e)}"
