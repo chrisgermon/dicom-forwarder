@@ -92,8 +92,9 @@ create_secret_if_not_exists "SHAREPOINT_CLIENT_SECRET" "PLACEHOLDER_UPDATE_ME"
 create_secret_if_not_exists "SHAREPOINT_TENANT_ID" "PLACEHOLDER_UPDATE_ME"
 create_secret_if_not_exists "SHAREPOINT_REFRESH_TOKEN" "PLACEHOLDER_UPDATE_ME"
 
-# Quoter secrets
-create_secret_if_not_exists "QUOTER_API_KEY" "PLACEHOLDER_UPDATE_ME"
+# Quoter OAuth secrets
+create_secret_if_not_exists "QUOTER_CLIENT_ID" "PLACEHOLDER_UPDATE_ME"
+create_secret_if_not_exists "QUOTER_CLIENT_SECRET" "PLACEHOLDER_UPDATE_ME"
 
 # FortiCloud secrets
 create_secret_if_not_exists "FORTICLOUD_API_KEY" "PLACEHOLDER_UPDATE_ME"
@@ -143,7 +144,8 @@ gcloud run deploy $SERVICE_NAME \
     --set-secrets="SHAREPOINT_CLIENT_SECRET=SHAREPOINT_CLIENT_SECRET:latest" \
     --set-secrets="SHAREPOINT_TENANT_ID=SHAREPOINT_TENANT_ID:latest" \
     --set-secrets="SHAREPOINT_REFRESH_TOKEN=SHAREPOINT_REFRESH_TOKEN:latest" \
-    --set-secrets="QUOTER_API_KEY=QUOTER_API_KEY:latest" \
+    --set-secrets="QUOTER_CLIENT_ID=QUOTER_CLIENT_ID:latest" \
+    --set-secrets="QUOTER_CLIENT_SECRET=QUOTER_CLIENT_SECRET:latest" \
     --set-secrets="FORTICLOUD_API_KEY=FORTICLOUD_API_KEY:latest" \
     --set-secrets="FORTICLOUD_API_SECRET=FORTICLOUD_API_SECRET:latest" \
     --set-secrets="FORTICLOUD_CLIENT_ID=FORTICLOUD_CLIENT_ID:latest" \
