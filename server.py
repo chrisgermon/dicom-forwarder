@@ -4902,28 +4902,155 @@ async def sharepoint_upload_file(
 
 
 # ============================================================================
-# Quoter Integration (ScalePad Quoter - MSP Quoting Software)
+# Quoter Integration (OAuth 2.0 Client Credentials Flow)
 # ============================================================================
 
-class QuoterConfig:
-    """Quoter API Configuration (now part of ScalePad)"""
-    def __init__(self):
-        self.api_key = os.getenv("QUOTER_API_KEY", "")
-        self.base_url = "https://api.scalepad.com/quoter/v1"
+class QuoterOAuthClient:
+    """
+    Quoter API client with OAuth 2.0 Client Credentials Flow.
+
+    Handles automatic token refresh and provides methods for all Quoter API operations.
+
+    Environment Variables Required:
+    - QUOTER_CLIENT_ID: OAuth Client ID from Quoter Account > API Keys
+    - QUOTER_CLIENT_SECRET: OAuth Client Secret from Quoter Account > API Keys
+    """
+
+    def __init__(
+        self,
+        client_id: Optional[str] = None,
+        client_secret: Optional[str] = None,
+    ):
+        self.base_url = "https://api.quoter.com/v1"
+        self.client_id = client_id or os.getenv("QUOTER_CLIENT_ID")
+        self.client_secret = client_secret or os.getenv("QUOTER_CLIENT_SECRET")
+
+        self.access_token: Optional[str] = None
+        self.refresh_token: Optional[str] = None
+        self.token_expires_at: Optional[datetime] = None
 
     @property
     def is_configured(self) -> bool:
-        return bool(self.api_key)
+        """Check if OAuth credentials are configured."""
+        return bool(self.client_id and self.client_secret)
 
-    def get_headers(self) -> dict:
-        """Get headers for Quoter API requests using x-api-key authentication."""
-        return {
-            "x-api-key": self.api_key,
-            "Content-Type": "application/json",
-            "Accept": "application/json"
-        }
+    async def _ensure_authenticated(self):
+        """Get or refresh OAuth token as needed."""
+        # Check if we have a valid token
+        if (
+            self.access_token
+            and self.token_expires_at
+            and datetime.now() < self.token_expires_at
+        ):
+            return  # Token still valid
 
-quoter_config = QuoterConfig()
+        if self.refresh_token:
+            # Try to refresh existing token
+            try:
+                await self._refresh_token()
+                return
+            except Exception as e:
+                logger.warning(f"Quoter token refresh failed, getting new token: {e}")
+
+        # Get new token
+        await self._authorize()
+
+    async def _authorize(self):
+        """Get initial OAuth access token."""
+        logger.info("Authorizing with Quoter OAuth...")
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{self.base_url}/auth/oauth/authorize",
+                json={
+                    "client_id": self.client_id,
+                    "client_secret": self.client_secret,
+                    "grant_type": "client_credentials"
+                },
+                headers={
+                    "Content-Type": "application/json",
+                    "Accept": "application/json"
+                }
+            )
+            response.raise_for_status()
+            data = response.json()
+
+            self.access_token = data["access_token"]
+            self.refresh_token = data.get("refresh_token")
+            # Token valid for 1 hour, refresh at 55 minutes for safety
+            self.token_expires_at = datetime.now() + timedelta(minutes=55)
+
+            logger.info("Quoter OAuth authorization successful")
+
+    async def _refresh_token(self):
+        """Refresh expired access token using refresh token."""
+        logger.info("Refreshing Quoter OAuth token...")
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{self.base_url}/auth/refresh",
+                headers={
+                    "Authorization": f"Bearer {self.refresh_token}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json"
+                }
+            )
+
+            if response.status_code == 401:
+                # Refresh token expired (24 hours), need new auth
+                logger.warning("Quoter refresh token expired, getting new authorization")
+                self.refresh_token = None
+                await self._authorize()
+                return
+
+            response.raise_for_status()
+            data = response.json()
+
+            self.access_token = data["access_token"]
+            self.refresh_token = data.get("refresh_token")
+            self.token_expires_at = datetime.now() + timedelta(minutes=55)
+
+            logger.info("Quoter OAuth token refreshed successfully")
+
+    async def request(
+        self,
+        method: str,
+        endpoint: str,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Make an authenticated request to the Quoter API."""
+        await self._ensure_authenticated()
+
+        url = f"{self.base_url}/{endpoint.lstrip('/')}"
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.request(
+                method,
+                url,
+                headers={
+                    "Authorization": f"Bearer {self.access_token}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json"
+                },
+                **kwargs
+            )
+            response.raise_for_status()
+
+            if response.status_code == 204:
+                return {}
+
+            return response.json() if response.content else {}
+
+# Global Quoter OAuth client instance
+_quoter_client: Optional[QuoterOAuthClient] = None
+
+
+def get_quoter_client() -> QuoterOAuthClient:
+    """Get or create the Quoter OAuth client singleton."""
+    global _quoter_client
+    if _quoter_client is None:
+        _quoter_client = QuoterOAuthClient()
+    return _quoter_client
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
@@ -4932,26 +5059,22 @@ async def quoter_list_quotes(
     limit: int = Field(50, description="Max results (1-100)"),
     page: int = Field(1, description="Page number")
 ) -> str:
-    """List quotes from Quoter (ScalePad)."""
-    if not quoter_config.is_configured:
-        return "Error: Quoter not configured. Set QUOTER_API_KEY."
+    """List quotes from Quoter."""
+    client = get_quoter_client()
+    if not client.is_configured:
+        return "Error: Quoter not configured. Set QUOTER_CLIENT_ID and QUOTER_CLIENT_SECRET."
 
     try:
         params = {"limit": min(max(1, limit), 100), "page": page}
+        if status:
+            params["status"] = status
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{quoter_config.base_url}/quotes",
-                params=params,
-                headers=quoter_config.get_headers()
-            )
-            response.raise_for_status()
-            data = response.json()
-        
+        data = await client.request("GET", "quotes", params=params)
+
         quotes = data.get("data", [])
         if not quotes:
             return "No quotes found."
-        
+
         results = []
         for q in quotes:
             quote_id = q.get("id", "N/A")
@@ -4960,9 +5083,9 @@ async def quoter_list_quotes(
             total = q.get("total", 0)
             contact = q.get("contact_name", q.get("organization", "N/A"))
             created = q.get("created_at", "")[:10] if q.get("created_at") else "N/A"
-            
+
             results.append(f"**{name}** (ID: {quote_id})\n  Contact: {contact} | Status: {status_val} | Total: ${total:,.2f} | Created: {created}")
-        
+
         has_more = data.get("has_more", False)
         more_msg = " (more available)" if has_more else ""
         return f"Found {len(results)} quote(s){more_msg}:\n\n" + "\n\n".join(results)
@@ -4976,28 +5099,22 @@ async def quoter_list_contacts(
     limit: int = Field(50, description="Max results (1-100)"),
     page: int = Field(1, description="Page number")
 ) -> str:
-    """List contacts from Quoter (ScalePad)."""
-    if not quoter_config.is_configured:
-        return "Error: Quoter not configured. Set QUOTER_API_KEY."
+    """List contacts from Quoter."""
+    client = get_quoter_client()
+    if not client.is_configured:
+        return "Error: Quoter not configured. Set QUOTER_CLIENT_ID and QUOTER_CLIENT_SECRET."
 
     try:
         params = {"limit": min(max(1, limit), 100), "page": page}
         if search:
             params["organization[cont]"] = search
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{quoter_config.base_url}/contacts",
-                params=params,
-                headers=quoter_config.get_headers()
-            )
-            response.raise_for_status()
-            data = response.json()
-        
+        data = await client.request("GET", "contacts", params=params)
+
         contacts = data.get("data", [])
         if not contacts:
             return "No contacts found."
-        
+
         results = []
         for c in contacts:
             contact_id = c.get("id", "N/A")
@@ -5005,9 +5122,9 @@ async def quoter_list_contacts(
             org = c.get("organization", "N/A")
             email = c.get("email", "N/A")
             phone = c.get("work_phone", c.get("mobile_phone", "N/A"))
-            
+
             results.append(f"**{name}** (ID: {contact_id})\n  Organization: {org} | Email: {email} | Phone: {phone}")
-        
+
         return f"Found {len(results)} contact(s):\n\n" + "\n\n".join(results)
     except Exception as e:
         return f"Error: {str(e)}"
@@ -5017,19 +5134,14 @@ async def quoter_list_contacts(
 async def quoter_get_contact(
     contact_id: str = Field(..., description="Contact ID")
 ) -> str:
-    """Get detailed contact information from Quoter (ScalePad)."""
-    if not quoter_config.is_configured:
-        return "Error: Quoter not configured. Set QUOTER_API_KEY."
+    """Get detailed contact information from Quoter."""
+    client = get_quoter_client()
+    if not client.is_configured:
+        return "Error: Quoter not configured. Set QUOTER_CLIENT_ID and QUOTER_CLIENT_SECRET."
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{quoter_config.base_url}/contacts/{contact_id}",
-                headers=quoter_config.get_headers()
-            )
-            response.raise_for_status()
-            c = response.json()
-        
+        c = await client.request("GET", f"contacts/{contact_id}")
+
         return f"""# Contact: {c.get('first_name', '')} {c.get('last_name', '')}
 
 **ID:** {c.get('id', 'N/A')}
@@ -5060,40 +5172,43 @@ async def quoter_create_contact(
     email: str = Field(..., description="Email address"),
     organization: Optional[str] = Field(None, description="Organization/company name"),
     work_phone: Optional[str] = Field(None, description="Work phone number"),
+    mobile_phone: Optional[str] = Field(None, description="Mobile phone number"),
     billing_address: Optional[str] = Field(None, description="Billing address"),
     billing_city: Optional[str] = Field(None, description="Billing city"),
     billing_region_iso: Optional[str] = Field(None, description="Billing state/region (e.g., 'NSW', 'VIC')"),
     billing_postal_code: Optional[str] = Field(None, description="Billing postal code"),
     billing_country_iso: Optional[str] = Field("AU", description="Billing country ISO code (default: AU)")
 ) -> str:
-    """Create a new contact in Quoter (ScalePad)."""
-    if not quoter_config.is_configured:
-        return "Error: Quoter not configured. Set QUOTER_API_KEY."
+    """Create a new contact in Quoter."""
+    client = get_quoter_client()
+    if not client.is_configured:
+        return "Error: Quoter not configured. Set QUOTER_CLIENT_ID and QUOTER_CLIENT_SECRET."
 
     try:
-        payload = {
+        payload: Dict[str, Any] = {
             "first_name": first_name,
             "last_name": last_name,
-            "email": email
+            "email": email,
+            "billing_country_iso": billing_country_iso or "AU",
         }
-        if organization: payload["organization"] = organization
-        if work_phone: payload["work_phone"] = work_phone
-        if billing_address: payload["billing_address"] = billing_address
-        if billing_city: payload["billing_city"] = billing_city
-        if billing_region_iso: payload["billing_region_iso"] = billing_region_iso
-        if billing_postal_code: payload["billing_postal_code"] = billing_postal_code
-        if billing_country_iso: payload["billing_country_iso"] = billing_country_iso
+        if organization:
+            payload["organization"] = organization
+        if work_phone:
+            payload["work_phone"] = work_phone
+        if mobile_phone:
+            payload["mobile_phone"] = mobile_phone
+        if billing_address:
+            payload["billing_address"] = billing_address
+        if billing_city:
+            payload["billing_city"] = billing_city
+        if billing_region_iso:
+            payload["billing_region_iso"] = billing_region_iso
+        if billing_postal_code:
+            payload["billing_postal_code"] = billing_postal_code
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{quoter_config.base_url}/contacts",
-                json=payload,
-                headers=quoter_config.get_headers()
-            )
-            response.raise_for_status()
-            c = response.json()
-        
-        return f"✅ Contact created: **{first_name} {last_name}** (ID: {c.get('id', 'N/A')})"
+        c = await client.request("POST", "contacts", json=payload)
+
+        return f"Contact created: **{first_name} {last_name}** (ID: {c.get('id', 'N/A')})"
     except Exception as e:
         return f"Error: {str(e)}"
 
@@ -5105,9 +5220,10 @@ async def quoter_list_items(
     limit: int = Field(50, description="Max results (1-100)"),
     page: int = Field(1, description="Page number")
 ) -> str:
-    """List items/products from Quoter (ScalePad)."""
-    if not quoter_config.is_configured:
-        return "Error: Quoter not configured. Set QUOTER_API_KEY."
+    """List items/products from Quoter."""
+    client = get_quoter_client()
+    if not client.is_configured:
+        return "Error: Quoter not configured. Set QUOTER_CLIENT_ID and QUOTER_CLIENT_SECRET."
 
     try:
         params = {"limit": min(max(1, limit), 100), "page": page}
@@ -5116,19 +5232,12 @@ async def quoter_list_items(
         if category_id:
             params["category_id"] = category_id
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{quoter_config.base_url}/items",
-                params=params,
-                headers=quoter_config.get_headers()
-            )
-            response.raise_for_status()
-            data = response.json()
-        
+        data = await client.request("GET", "items", params=params)
+
         items = data.get("data", [])
         if not items:
             return "No items found."
-        
+
         results = []
         for i in items:
             item_id = i.get("id", "N/A")
@@ -5141,9 +5250,9 @@ async def quoter_list_items(
                 price = 0
             category = i.get("category_name", "N/A")
             item_type = i.get("type", "N/A")
-            
+
             results.append(f"**{name}** (SKU: {sku})\n  ID: {item_id} | Type: {item_type} | Price: ${price:,.2f} | Category: {category}")
-        
+
         return f"Found {len(results)} item(s):\n\n" + "\n\n".join(results)
     except Exception as e:
         return f"Error: {str(e)}"
@@ -5153,31 +5262,26 @@ async def quoter_list_items(
 async def quoter_get_item(
     item_id: str = Field(..., description="Item ID")
 ) -> str:
-    """Get detailed item information from Quoter (ScalePad)."""
-    if not quoter_config.is_configured:
-        return "Error: Quoter not configured. Set QUOTER_API_KEY."
+    """Get detailed item information from Quoter."""
+    client = get_quoter_client()
+    if not client.is_configured:
+        return "Error: Quoter not configured. Set QUOTER_CLIENT_ID and QUOTER_CLIENT_SECRET."
 
     try:
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{quoter_config.base_url}/items/{item_id}",
-                headers=quoter_config.get_headers()
-            )
-            response.raise_for_status()
-            i = response.json()
-        
+        i = await client.request("GET", f"items/{item_id}")
+
         price = i.get("price_amount_decimal", 0)
         try:
             price = float(price) / 100 if price else 0
         except:
             price = 0
-        
+
         cost = i.get("cost_amount_decimal", 0)
         try:
             cost = float(cost) / 100 if cost else 0
         except:
             cost = 0
-        
+
         return f"""# Item: {i.get('name', 'Unknown')}
 
 **ID:** {i.get('id', 'N/A')}
@@ -5208,35 +5312,29 @@ async def quoter_list_categories(
     limit: int = Field(100, description="Max results (1-100)"),
     page: int = Field(1, description="Page number")
 ) -> str:
-    """List categories from Quoter (ScalePad)."""
-    if not quoter_config.is_configured:
-        return "Error: Quoter not configured. Set QUOTER_API_KEY."
+    """List categories from Quoter."""
+    client = get_quoter_client()
+    if not client.is_configured:
+        return "Error: Quoter not configured. Set QUOTER_CLIENT_ID and QUOTER_CLIENT_SECRET."
 
     try:
         params = {"limit": min(max(1, limit), 100), "page": page}
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{quoter_config.base_url}/categories",
-                params=params,
-                headers=quoter_config.get_headers()
-            )
-            response.raise_for_status()
-            data = response.json()
-        
+        data = await client.request("GET", "categories", params=params)
+
         categories = data.get("data", [])
         if not categories:
             return "No categories found."
-        
+
         results = []
         for c in categories:
             cat_id = c.get("id", "N/A")
             name = c.get("name", "Untitled")
             parent = c.get("parent_category", "")
-            
+
             parent_info = f" (Parent: {parent})" if parent else ""
             results.append(f"- **{name}** (ID: {cat_id}){parent_info}")
-        
+
         return f"## Categories\n\n" + "\n".join(results)
     except Exception as e:
         return f"Error: {str(e)}"
@@ -5247,33 +5345,27 @@ async def quoter_list_templates(
     limit: int = Field(50, description="Max results (1-100)"),
     page: int = Field(1, description="Page number")
 ) -> str:
-    """List quote templates from Quoter (ScalePad)."""
-    if not quoter_config.is_configured:
-        return "Error: Quoter not configured. Set QUOTER_API_KEY."
+    """List quote templates from Quoter."""
+    client = get_quoter_client()
+    if not client.is_configured:
+        return "Error: Quoter not configured. Set QUOTER_CLIENT_ID and QUOTER_CLIENT_SECRET."
 
     try:
         params = {"limit": min(max(1, limit), 100), "page": page}
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{quoter_config.base_url}/quote_templates",
-                params=params,
-                headers=quoter_config.get_headers()
-            )
-            response.raise_for_status()
-            data = response.json()
-        
+        data = await client.request("GET", "quote_templates", params=params)
+
         templates = data.get("data", [])
         if not templates:
             return "No quote templates found."
-        
+
         results = []
         for t in templates:
             template_id = t.get("id", "N/A")
             name = t.get("name", "Untitled")
-            
+
             results.append(f"- **{name}** (ID: {template_id})")
-        
+
         return f"## Quote Templates\n\n" + "\n".join(results)
     except Exception as e:
         return f"Error: {str(e)}"
@@ -5281,31 +5373,27 @@ async def quoter_list_templates(
 
 @mcp.tool(annotations={"readOnlyHint": False})
 async def quoter_create_quote(
-    contact_id: str = Field(..., description="Contact ID"),
+    contact_id: str = Field(..., description="Contact ID (e.g., 'cont_xxx')"),
     name: Optional[str] = Field(None, description="Quote name/title"),
-    template_id: Optional[str] = Field(None, description="Quote template ID to use")
+    template_id: Optional[str] = Field(None, description="Quote template ID to use (e.g., 'tmpl_xxx')")
 ) -> str:
-    """Create a new draft quote in Quoter (ScalePad)."""
-    if not quoter_config.is_configured:
-        return "Error: Quoter not configured. Set QUOTER_API_KEY."
+    """Create a new draft quote in Quoter."""
+    client = get_quoter_client()
+    if not client.is_configured:
+        return "Error: Quoter not configured. Set QUOTER_CLIENT_ID and QUOTER_CLIENT_SECRET."
 
     try:
-        payload = {"contact_id": contact_id}
-        if name: payload["name"] = name
-        if template_id: payload["quote_template_id"] = template_id
+        payload: Dict[str, Any] = {"contact_id": contact_id}
+        if name:
+            payload["name"] = name
+        if template_id:
+            payload["template_id"] = template_id
 
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                f"{quoter_config.base_url}/quotes",
-                json=payload,
-                headers=quoter_config.get_headers()
-            )
-            response.raise_for_status()
-            q = response.json()
-        
+        q = await client.request("POST", "quotes", json=payload)
+
         quote_name = q.get("name", "Draft Quote")
         quote_id = q.get("id", "N/A")
-        return f"✅ Quote created: **{quote_name}** (ID: {quote_id})\n\nNote: This creates a draft quote. Add line items and publish via the Quoter web interface."
+        return f"Quote created: **{quote_name}** (ID: {quote_id})\n\nNote: All quotes created via API are saved as Draft status. You can add line items using quoter_add_line_item."
     except Exception as e:
         return f"Error: {str(e)}"
 
@@ -5316,35 +5404,29 @@ async def quoter_list_manufacturers(
     limit: int = Field(50, description="Max results (1-100)"),
     page: int = Field(1, description="Page number")
 ) -> str:
-    """List manufacturers from Quoter (ScalePad)."""
-    if not quoter_config.is_configured:
-        return "Error: Quoter not configured. Set QUOTER_API_KEY."
+    """List manufacturers from Quoter."""
+    client = get_quoter_client()
+    if not client.is_configured:
+        return "Error: Quoter not configured. Set QUOTER_CLIENT_ID and QUOTER_CLIENT_SECRET."
 
     try:
         params = {"limit": min(max(1, limit), 100), "page": page}
         if search:
             params["name[cont]"] = search
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{quoter_config.base_url}/manufacturers",
-                params=params,
-                headers=quoter_config.get_headers()
-            )
-            response.raise_for_status()
-            data = response.json()
-        
+        data = await client.request("GET", "manufacturers", params=params)
+
         manufacturers = data.get("data", [])
         if not manufacturers:
             return "No manufacturers found."
-        
+
         results = []
         for m in manufacturers:
             mfr_id = m.get("id", "N/A")
             name = m.get("name", "Unknown")
-            
+
             results.append(f"- **{name}** (ID: {mfr_id})")
-        
+
         return f"## Manufacturers\n\n" + "\n".join(results)
     except Exception as e:
         return f"Error: {str(e)}"
@@ -5355,34 +5437,134 @@ async def quoter_list_suppliers(
     limit: int = Field(50, description="Max results (1-100)"),
     page: int = Field(1, description="Page number")
 ) -> str:
-    """List suppliers from Quoter (ScalePad)."""
-    if not quoter_config.is_configured:
-        return "Error: Quoter not configured. Set QUOTER_API_KEY."
+    """List suppliers from Quoter."""
+    client = get_quoter_client()
+    if not client.is_configured:
+        return "Error: Quoter not configured. Set QUOTER_CLIENT_ID and QUOTER_CLIENT_SECRET."
 
     try:
         params = {"limit": min(max(1, limit), 100), "page": page}
 
-        async with httpx.AsyncClient() as client:
-            response = await client.get(
-                f"{quoter_config.base_url}/suppliers",
-                params=params,
-                headers=quoter_config.get_headers()
-            )
-            response.raise_for_status()
-            data = response.json()
-        
+        data = await client.request("GET", "suppliers", params=params)
+
         suppliers = data.get("data", [])
         if not suppliers:
             return "No suppliers found."
-        
+
         results = []
         for s in suppliers:
             supplier_id = s.get("id", "N/A")
             name = s.get("name", "Unknown")
-            
+
             results.append(f"- **{name}** (ID: {supplier_id})")
-        
+
         return f"## Suppliers\n\n" + "\n".join(results)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def quoter_add_line_item(
+    quote_id: str = Field(..., description="Quote ID (e.g., 'quot_xxx')"),
+    description: str = Field(..., description="Line item description"),
+    quantity: int = Field(1, description="Quantity (default: 1)"),
+    unit_price: float = Field(0.0, description="Unit price in dollars (default: 0)"),
+    item_id: Optional[str] = Field(None, description="Optional item ID from catalog"),
+    taxable: bool = Field(True, description="Whether item is taxable (default: True)"),
+    optional: bool = Field(False, description="Whether item is optional for customer (default: False)"),
+    hidden: bool = Field(False, description="Whether item is hidden from customer (default: False)")
+) -> str:
+    """Add a line item to a quote in Quoter."""
+    client = get_quoter_client()
+    if not client.is_configured:
+        return "Error: Quoter not configured. Set QUOTER_CLIENT_ID and QUOTER_CLIENT_SECRET."
+
+    try:
+        # Convert dollars to cents (API expects decimal string in cents)
+        price_cents = str(int(unit_price * 100))
+
+        payload: Dict[str, Any] = {
+            "quote_id": quote_id,
+            "description": description,
+            "quantity": quantity,
+            "unit_price_amount_decimal": price_cents,
+            "taxable": taxable,
+            "optional": optional,
+            "hidden": hidden,
+        }
+
+        if item_id:
+            payload["item_id"] = item_id
+
+        result = await client.request("POST", "line_items", json=payload)
+
+        line_id = result.get("id", "N/A")
+        total = quantity * unit_price
+
+        return f"""Line item added!
+
+**Line ID:** {line_id}
+**Description:** {description}
+**Quantity:** {quantity}
+**Unit Price:** ${unit_price:.2f}
+**Line Total:** ${total:.2f}
+**Taxable:** {taxable}"""
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def quoter_update_contact(
+    contact_id: str = Field(..., description="Contact ID to update"),
+    first_name: Optional[str] = Field(None, description="First name"),
+    last_name: Optional[str] = Field(None, description="Last name"),
+    email: Optional[str] = Field(None, description="Email address"),
+    organization: Optional[str] = Field(None, description="Organization/company name"),
+    work_phone: Optional[str] = Field(None, description="Work phone number"),
+    mobile_phone: Optional[str] = Field(None, description="Mobile phone number"),
+    billing_address: Optional[str] = Field(None, description="Billing address"),
+    billing_city: Optional[str] = Field(None, description="Billing city"),
+    billing_region_iso: Optional[str] = Field(None, description="Billing state/region (e.g., 'NSW', 'VIC')"),
+    billing_postal_code: Optional[str] = Field(None, description="Billing postal code"),
+    billing_country_iso: Optional[str] = Field(None, description="Billing country ISO code")
+) -> str:
+    """Update an existing contact in Quoter (partial update supported)."""
+    client = get_quoter_client()
+    if not client.is_configured:
+        return "Error: Quoter not configured. Set QUOTER_CLIENT_ID and QUOTER_CLIENT_SECRET."
+
+    try:
+        payload: Dict[str, Any] = {}
+        if first_name is not None:
+            payload["first_name"] = first_name
+        if last_name is not None:
+            payload["last_name"] = last_name
+        if email is not None:
+            payload["email"] = email
+        if organization is not None:
+            payload["organization"] = organization
+        if work_phone is not None:
+            payload["work_phone"] = work_phone
+        if mobile_phone is not None:
+            payload["mobile_phone"] = mobile_phone
+        if billing_address is not None:
+            payload["billing_address"] = billing_address
+        if billing_city is not None:
+            payload["billing_city"] = billing_city
+        if billing_region_iso is not None:
+            payload["billing_region_iso"] = billing_region_iso
+        if billing_postal_code is not None:
+            payload["billing_postal_code"] = billing_postal_code
+        if billing_country_iso is not None:
+            payload["billing_country_iso"] = billing_country_iso
+
+        if not payload:
+            return "Error: No fields to update provided."
+
+        c = await client.request("PATCH", f"contacts/{contact_id}", json=payload)
+
+        name = f"{c.get('first_name', '')} {c.get('last_name', '')}".strip() or "N/A"
+        return f"Contact updated: **{name}** (ID: {c.get('id', contact_id)})"
     except Exception as e:
         return f"Error: {str(e)}"
 
@@ -10173,10 +10355,16 @@ async def server_status() -> str:
     else:
         lines.append("⚠️ **Front:** Not configured")
     
-    if quoter_config.is_configured:
-        lines.append("✅ **Quoter (ScalePad):** Configured")
+    quoter_client = get_quoter_client()
+    if quoter_client.is_configured:
+        lines.append("✅ **Quoter:** OAuth configured")
     else:
-        lines.append("⚠️ **Quoter (ScalePad):** Not configured (set QUOTER_API_KEY)")
+        missing = []
+        if not os.getenv("QUOTER_CLIENT_ID"):
+            missing.append("CLIENT_ID")
+        if not os.getenv("QUOTER_CLIENT_SECRET"):
+            missing.append("CLIENT_SECRET")
+        lines.append(f"⚠️ **Quoter:** Missing: {', '.join(missing)}")
 
     if pax8_config.is_configured:
         try:
@@ -11043,10 +11231,10 @@ if __name__ == "__main__":
         },
         {
             "name": "Quoter",
-            "config": quoter_config,
+            "config": get_quoter_client(),
             "category": "Quoting",
-            "check_type": "api_key",
-            "env_vars": ["QUOTER_API_KEY"]
+            "check_type": "oauth",
+            "env_vars": ["QUOTER_CLIENT_ID", "QUOTER_CLIENT_SECRET"]
         },
         {
             "name": "Pax8",
@@ -11160,7 +11348,7 @@ if __name__ == "__main__":
             result["endpoint"] = getattr(config, 'base_url', None)
             result["api_version"] = "1.0"
         elif name == "Quoter":
-            result["endpoint"] = "https://api.scalepad.com/quoter"
+            result["endpoint"] = "https://api.quoter.com"
             result["api_version"] = "v1"
         elif name == "Pax8":
             result["endpoint"] = "https://api.pax8.com"
