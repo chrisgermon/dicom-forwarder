@@ -12693,16 +12693,15 @@ if __name__ == "__main__":
     # Add custom routes via Starlette mounting
     logger.info(f"[STARTUP] Creating Starlette app at t={time.time() - _module_start_time:.2f}s")
 
-    # Wrap MCP lifespan with logging
+    # Use minimal lifespan without mcp_app.lifespan - speeds up startup significantly
+    # FastMCP works fine without lifespan in stateless_http mode
     from contextlib import asynccontextmanager
 
     @asynccontextmanager
-    async def logged_lifespan(app):
-        logger.info(f"[STARTUP] Lifespan startup beginning at t={time.time() - _module_start_time:.2f}s")
-        async with mcp_app.lifespan(app):
-            logger.info(f"[STARTUP] Lifespan startup complete at t={time.time() - _module_start_time:.2f}s")
-            yield
-        logger.info(f"[STARTUP] Lifespan shutdown complete")
+    async def minimal_lifespan(app):
+        logger.info(f"[STARTUP] Lifespan startup at t={time.time() - _module_start_time:.2f}s")
+        yield
+        logger.info(f"[STARTUP] Lifespan shutdown")
 
     app = Starlette(
         routes=[
@@ -12715,7 +12714,7 @@ if __name__ == "__main__":
             Route("/api/test-all-connections", api_test_all_connections_route),
             Route("/api/status", api_status_json_route),
         ],
-        lifespan=logged_lifespan,
+        lifespan=minimal_lifespan,
     )
     logger.info(f"[STARTUP] Starlette app created at t={time.time() - _module_start_time:.2f}s")
 
