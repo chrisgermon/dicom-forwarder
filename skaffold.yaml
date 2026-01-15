@@ -13,7 +13,7 @@ build:
 # Deploy to Cloud Run
 deploy:
   cloudrun:
-    projectId: crowdmcp
+    projectID: crowdmcp
     region: australia-southeast1
 
 # Port forwarding for local development
