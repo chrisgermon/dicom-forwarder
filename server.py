@@ -10949,8 +10949,8 @@ if __name__ == "__main__":
         """
         try:
             import asyncio
-            from google.cloud.devtools.cloudbuild_v1 import CloudBuildClient
-            from google.cloud.devtools.cloudbuild_v1.types import ListBuildsRequest
+            from google.cloud.build_v1 import CloudBuildClient
+            from google.cloud.build_v1.types import ListBuildsRequest
 
             project_id = os.getenv("GCP_PROJECT_ID", os.getenv("GOOGLE_CLOUD_PROJECT", "crowdmcp"))
 
@@ -11040,8 +11040,8 @@ if __name__ == "__main__":
         """
         try:
             import asyncio
-            from google.cloud.devtools.cloudbuild_v1 import CloudBuildClient
-            from google.cloud.devtools.cloudbuild_v1.types import ListBuildsRequest
+            from google.cloud.build_v1 import CloudBuildClient
+            from google.cloud.build_v1.types import ListBuildsRequest
 
             project_id = os.getenv("GCP_PROJECT_ID", os.getenv("GOOGLE_CLOUD_PROJECT", "crowdmcp"))
 
@@ -12765,7 +12765,6 @@ if __name__ == "__main__":
         host="0.0.0.0", 
         port=port,
         timeout_keep_alive=5,  # Reduce keep-alive timeout
-        timeout_notify=30,     # Timeout for ASGI startup notification
         access_log=True,       # Enable access logs for debugging
         log_level="info"       # Set appropriate log level
     )
