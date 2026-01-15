@@ -3,13 +3,19 @@ Crowd IT Unified MCP Server
 Centralized MCP server for Cloud Run - HaloPSA, Xero, Front, SharePoint, Quoter, Pax8, BigQuery, Maxotel VoIP, Ubuntu Server (SSH), CIPP (M365), and Salesforce integration.
 """
 
+# Absolute first thing - print to both stdout and stderr
+print("[STARTUP] Python interpreter starting")
 import sys
+print("[STARTUP] sys imported", file=sys.stderr, flush=True)
 import os
+print(f"[STARTUP] os imported, PORT={os.getenv('PORT')}, __name__={__name__}", file=sys.stderr, flush=True)
 
 # CRITICAL: Start a minimal health check server IMMEDIATELY to satisfy Cloud Run
 # Using raw socket for fastest possible startup
 _quick_server_socket = None
+_quick_server_running = False
 if __name__ == "__main__" and os.getenv("PORT"):
+    print("[STARTUP] Condition met, starting quick server...", file=sys.stderr, flush=True)
     try:
         print("[STARTUP] Quick-starting socket health server...", file=sys.stderr, flush=True)
 
