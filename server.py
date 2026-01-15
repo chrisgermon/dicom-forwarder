@@ -4615,6 +4615,397 @@ async def n8n_deactivate_workflow(
     except Exception as e:
         return f"Error: {str(e)}"
 
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+async def n8n_create_workflow(
+    name: str = Field(..., description="Name of the new workflow"),
+    nodes: Optional[str] = Field(None, description="JSON string of nodes array (optional, creates empty workflow if not provided)"),
+    connections: Optional[str] = Field(None, description="JSON string of connections object (optional)"),
+    active: bool = Field(False, description="Whether to activate the workflow immediately")
+) -> str:
+    """Create a new n8n workflow."""
+    if not n8n_config.is_configured:
+        return "Error: n8n not configured."
+    try:
+        import json as json_module
+
+        workflow_data = {
+            "name": name,
+            "nodes": json_module.loads(nodes) if nodes else [],
+            "connections": json_module.loads(connections) if connections else {},
+            "active": active,
+            "settings": {}
+        }
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{n8n_config.api_url}/workflows",
+                headers=n8n_config.headers(),
+                json=workflow_data
+            )
+            response.raise_for_status()
+            w = response.json()
+
+        return f"""# Workflow Created Successfully!
+
+**Name:** {w.get('name', name)}
+**ID:** `{w.get('id')}`
+**Status:** {'Active' if w.get('active') else 'Inactive'}
+**Created:** {w.get('createdAt', 'N/A')}
+"""
+    except json_module.JSONDecodeError as e:
+        return f"Error: Invalid JSON in nodes or connections - {str(e)}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+async def n8n_update_workflow(
+    workflow_id: str = Field(..., description="Workflow ID to update"),
+    name: Optional[str] = Field(None, description="New name for the workflow"),
+    nodes: Optional[str] = Field(None, description="JSON string of nodes array"),
+    connections: Optional[str] = Field(None, description="JSON string of connections object"),
+    active: Optional[bool] = Field(None, description="Set workflow active state")
+) -> str:
+    """Update an existing n8n workflow."""
+    if not n8n_config.is_configured:
+        return "Error: n8n not configured."
+    try:
+        import json as json_module
+
+        # First get the current workflow
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{n8n_config.api_url}/workflows/{workflow_id}",
+                headers=n8n_config.headers()
+            )
+            response.raise_for_status()
+            current = response.json()
+
+        # Build update payload with current values as defaults
+        update_data = {
+            "name": name if name is not None else current.get("name"),
+            "nodes": json_module.loads(nodes) if nodes else current.get("nodes", []),
+            "connections": json_module.loads(connections) if connections else current.get("connections", {}),
+            "settings": current.get("settings", {})
+        }
+
+        if active is not None:
+            update_data["active"] = active
+
+        async with httpx.AsyncClient() as client:
+            response = await client.put(
+                f"{n8n_config.api_url}/workflows/{workflow_id}",
+                headers=n8n_config.headers(),
+                json=update_data
+            )
+            response.raise_for_status()
+            w = response.json()
+
+        return f"""# Workflow Updated Successfully!
+
+**Name:** {w.get('name')}
+**ID:** `{w.get('id')}`
+**Status:** {'Active' if w.get('active') else 'Inactive'}
+**Updated:** {w.get('updatedAt', 'N/A')}
+"""
+    except json_module.JSONDecodeError as e:
+        return f"Error: Invalid JSON in nodes or connections - {str(e)}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True})
+async def n8n_delete_workflow(
+    workflow_id: str = Field(..., description="Workflow ID to delete")
+) -> str:
+    """Delete an n8n workflow. This action cannot be undone."""
+    if not n8n_config.is_configured:
+        return "Error: n8n not configured."
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.delete(
+                f"{n8n_config.api_url}/workflows/{workflow_id}",
+                headers=n8n_config.headers()
+            )
+            response.raise_for_status()
+
+        return f"Workflow `{workflow_id}` deleted successfully."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True})
+async def n8n_delete_execution(
+    execution_id: str = Field(..., description="Execution ID to delete")
+) -> str:
+    """Delete an n8n execution record. This action cannot be undone."""
+    if not n8n_config.is_configured:
+        return "Error: n8n not configured."
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.delete(
+                f"{n8n_config.api_url}/executions/{execution_id}",
+                headers=n8n_config.headers()
+            )
+            response.raise_for_status()
+
+        return f"Execution `{execution_id}` deleted successfully."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+async def n8n_retry_execution(
+    execution_id: str = Field(..., description="Execution ID to retry")
+) -> str:
+    """Retry a failed n8n execution."""
+    if not n8n_config.is_configured:
+        return "Error: n8n not configured."
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{n8n_config.api_url}/executions/{execution_id}/retry",
+                headers=n8n_config.headers()
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        new_execution_id = data.get("data", {}).get("executionId", data.get("id", "N/A"))
+        return f"""Execution retried successfully!
+
+**Original Execution:** `{execution_id}`
+**New Execution ID:** `{new_execution_id}`
+"""
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def n8n_list_tags(
+    limit: int = Field(50, description="Max results (1-100)")
+) -> str:
+    """List all n8n tags."""
+    if not n8n_config.is_configured:
+        return "Error: n8n not configured."
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{n8n_config.api_url}/tags",
+                headers=n8n_config.headers(),
+                params={"limit": min(max(1, limit), 100)}
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        tags = data.get("data", data) if isinstance(data, dict) else data
+        if not tags:
+            return "No tags found."
+
+        results = [f"Found {len(tags)} tag(s):\n"]
+        for tag in tags[:limit]:
+            if isinstance(tag, dict):
+                results.append(f"- **{tag.get('name', 'Unnamed')}** (ID: `{tag.get('id')}`)")
+            else:
+                results.append(f"- {tag}")
+
+        return "\n".join(results)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+async def n8n_create_tag(
+    name: str = Field(..., description="Name of the tag to create")
+) -> str:
+    """Create a new n8n tag."""
+    if not n8n_config.is_configured:
+        return "Error: n8n not configured."
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{n8n_config.api_url}/tags",
+                headers=n8n_config.headers(),
+                json={"name": name}
+            )
+            response.raise_for_status()
+            tag = response.json()
+
+        return f"Tag **{tag.get('name', name)}** created successfully! (ID: `{tag.get('id')}`)"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+async def n8n_update_tag(
+    tag_id: str = Field(..., description="Tag ID to update"),
+    name: str = Field(..., description="New name for the tag")
+) -> str:
+    """Update an existing n8n tag."""
+    if not n8n_config.is_configured:
+        return "Error: n8n not configured."
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.put(
+                f"{n8n_config.api_url}/tags/{tag_id}",
+                headers=n8n_config.headers(),
+                json={"name": name}
+            )
+            response.raise_for_status()
+            tag = response.json()
+
+        return f"Tag updated successfully! New name: **{tag.get('name', name)}** (ID: `{tag.get('id')}`)"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True})
+async def n8n_delete_tag(
+    tag_id: str = Field(..., description="Tag ID to delete")
+) -> str:
+    """Delete an n8n tag. This action cannot be undone."""
+    if not n8n_config.is_configured:
+        return "Error: n8n not configured."
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.delete(
+                f"{n8n_config.api_url}/tags/{tag_id}",
+                headers=n8n_config.headers()
+            )
+            response.raise_for_status()
+
+        return f"Tag `{tag_id}` deleted successfully."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def n8n_list_variables(
+    limit: int = Field(50, description="Max results (1-100)")
+) -> str:
+    """List all n8n environment variables."""
+    if not n8n_config.is_configured:
+        return "Error: n8n not configured."
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{n8n_config.api_url}/variables",
+                headers=n8n_config.headers(),
+                params={"limit": min(max(1, limit), 100)}
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        variables = data.get("data", data) if isinstance(data, dict) else data
+        if not variables:
+            return "No variables found."
+
+        results = [f"Found {len(variables)} variable(s):\n"]
+        for var in variables[:limit]:
+            if isinstance(var, dict):
+                # Mask sensitive values
+                value = var.get('value', '')
+                masked_value = value[:3] + '***' if len(value) > 3 else '***'
+                results.append(f"- **{var.get('key', 'Unknown')}** = `{masked_value}` (ID: `{var.get('id')}`)")
+            else:
+                results.append(f"- {var}")
+
+        return "\n".join(results)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+async def n8n_create_variable(
+    key: str = Field(..., description="Variable key/name"),
+    value: str = Field(..., description="Variable value")
+) -> str:
+    """Create a new n8n environment variable."""
+    if not n8n_config.is_configured:
+        return "Error: n8n not configured."
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{n8n_config.api_url}/variables",
+                headers=n8n_config.headers(),
+                json={"key": key, "value": value}
+            )
+            response.raise_for_status()
+            var = response.json()
+
+        return f"Variable **{var.get('key', key)}** created successfully! (ID: `{var.get('id')}`)"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def n8n_list_projects(
+    limit: int = Field(50, description="Max results (1-100)")
+) -> str:
+    """List all n8n projects."""
+    if not n8n_config.is_configured:
+        return "Error: n8n not configured."
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                f"{n8n_config.api_url}/projects",
+                headers=n8n_config.headers(),
+                params={"limit": min(max(1, limit), 100)}
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        projects = data.get("data", data) if isinstance(data, dict) else data
+        if not projects:
+            return "No projects found."
+
+        results = [f"Found {len(projects)} project(s):\n"]
+        for proj in projects[:limit]:
+            if isinstance(proj, dict):
+                results.append(f"- **{proj.get('name', 'Unnamed')}** (ID: `{proj.get('id')}`) - Type: {proj.get('type', 'N/A')}")
+            else:
+                results.append(f"- {proj}")
+
+        return "\n".join(results)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def n8n_generate_audit(
+    categories: Optional[str] = Field(None, description="Comma-separated audit categories: credentials, database, filesystem, instance, nodes")
+) -> str:
+    """Generate a security audit report for the n8n instance."""
+    if not n8n_config.is_configured:
+        return "Error: n8n not configured."
+    try:
+        payload = {}
+        if categories:
+            payload["categories"] = [c.strip() for c in categories.split(",")]
+
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                f"{n8n_config.api_url}/audit",
+                headers=n8n_config.headers(),
+                json=payload
+            )
+            response.raise_for_status()
+            data = response.json()
+
+        # Format audit results
+        results = ["# n8n Security Audit Report\n"]
+
+        if isinstance(data, dict):
+            for category, issues in data.items():
+                if isinstance(issues, list) and issues:
+                    results.append(f"\n## {category.title()}\n")
+                    for issue in issues:
+                        if isinstance(issue, dict):
+                            risk = issue.get('risk', 'unknown')
+                            name = issue.get('name', 'Unknown issue')
+                            description = issue.get('description', '')
+                            results.append(f"- **[{risk.upper()}]** {name}")
+                            if description:
+                                results.append(f"  - {description}")
+                        else:
+                            results.append(f"- {issue}")
+                elif not issues:
+                    results.append(f"\n## {category.title()}\n")
+                    results.append("- No issues found.")
+        else:
+            results.append(f"\n{data}")
+
+        return "\n".join(results)
+    except Exception as e:
+        return f"Error: {str(e)}"
+
 
 # ============================================================================
 # SharePoint Integration (Microsoft Graph API)
