@@ -4,18 +4,29 @@ Centralized MCP server for Cloud Run - HaloPSA, Xero, Front, SharePoint, Quoter,
 """
 
 import os
+import time
+_module_start_time = time.time()
+
 import asyncio
 import logging
 import json
 import re
 from datetime import datetime, timedelta, date
 from typing import Optional, Dict, Any
-import httpx
-from fastmcp import FastMCP
-from pydantic import BaseModel, Field
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+logger.info(f"[STARTUP] Module imports started, stdlib complete at t={time.time() - _module_start_time:.2f}s")
+
+import httpx
+logger.info(f"[STARTUP] httpx imported at t={time.time() - _module_start_time:.2f}s")
+
+from fastmcp import FastMCP
+logger.info(f"[STARTUP] FastMCP imported at t={time.time() - _module_start_time:.2f}s")
+
+from pydantic import BaseModel, Field
+logger.info(f"[STARTUP] pydantic imported at t={time.time() - _module_start_time:.2f}s")
 
 # Cloud Run URL for OAuth callback
 CLOUD_RUN_URL = os.getenv("CLOUD_RUN_URL", "https://crowdit-mcp-server-lypf4vkh4q-ts.a.run.app")
@@ -25,6 +36,7 @@ mcp = FastMCP(
     instructions="Crowd IT Unified MCP Server - HaloPSA, Xero, Front, SharePoint, Quoter, Pax8, BigQuery, Maxotel VoIP, Ubuntu Server (SSH), CIPP (M365), and Salesforce integration for MSP operations.",
     stateless_http=True  # Required for Cloud Run - enables stateless sessions
 )
+logger.info(f"[STARTUP] FastMCP instance created at t={time.time() - _module_start_time:.2f}s")
 
 # ============================================================================
 # Secret Manager Helper
@@ -10546,18 +10558,24 @@ async def server_status() -> str:
 
 
 
+logger.info(f"[STARTUP] Module loading complete at t={time.time() - _module_start_time:.2f}s")
+
 # ============================================================================
 # Main Entry Point
 # ============================================================================
 
 if __name__ == "__main__":
+    logger.info(f"[STARTUP] __main__ block starting at t={time.time() - _module_start_time:.2f}s")
+
     import uvicorn
     from starlette.applications import Starlette
     from starlette.routing import Route, Mount
     from starlette.responses import PlainTextResponse, HTMLResponse
     from starlette.middleware import Middleware
     from starlette.middleware.base import BaseHTTPMiddleware
-    
+
+    logger.info(f"[STARTUP] Imports complete at t={time.time() - _module_start_time:.2f}s")
+
     # API Key validation middleware
     class APIKeyMiddleware(BaseHTTPMiddleware):
         """Middleware to validate API key for MCP endpoints."""
@@ -10598,10 +10616,12 @@ if __name__ == "__main__":
             return await call_next(request)
     
     port = int(os.getenv("PORT", 8080))
-    logger.info(f"🚀 Starting Crowd IT MCP Server on port {port}")
-    
+    logger.info(f"[STARTUP] Port={port} at t={time.time() - _module_start_time:.2f}s")
+
     # Get FastMCP's HTTP app
+    logger.info(f"[STARTUP] Creating FastMCP HTTP app at t={time.time() - _module_start_time:.2f}s")
     mcp_app = mcp.http_app()
+    logger.info(f"[STARTUP] FastMCP HTTP app created at t={time.time() - _module_start_time:.2f}s")
     
     # Starlette route handlers
     async def home_route(request):
@@ -12665,10 +12685,25 @@ if __name__ == "__main__":
         })
 
     # Get API key for middleware
+    logger.info(f"[STARTUP] Fetching API key at t={time.time() - _module_start_time:.2f}s")
     api_key = os.getenv("MCP_API_KEY") or get_secret_sync("MCP_API_KEY")
+    logger.info(f"[STARTUP] API key fetched at t={time.time() - _module_start_time:.2f}s")
 
     # Run FastMCP directly - it handles its own routing
     # Add custom routes via Starlette mounting
+    logger.info(f"[STARTUP] Creating Starlette app at t={time.time() - _module_start_time:.2f}s")
+
+    # Wrap MCP lifespan with logging
+    from contextlib import asynccontextmanager
+
+    @asynccontextmanager
+    async def logged_lifespan(app):
+        logger.info(f"[STARTUP] Lifespan startup beginning at t={time.time() - _module_start_time:.2f}s")
+        async with mcp_app.lifespan(app):
+            logger.info(f"[STARTUP] Lifespan startup complete at t={time.time() - _module_start_time:.2f}s")
+            yield
+        logger.info(f"[STARTUP] Lifespan shutdown complete")
+
     app = Starlette(
         routes=[
             Route("/health", health_route),
@@ -12680,13 +12715,15 @@ if __name__ == "__main__":
             Route("/api/test-all-connections", api_test_all_connections_route),
             Route("/api/status", api_status_json_route),
         ],
-        lifespan=mcp_app.lifespan,
+        lifespan=logged_lifespan,
     )
-    
+    logger.info(f"[STARTUP] Starlette app created at t={time.time() - _module_start_time:.2f}s")
+
     # Add API Key middleware for MCP endpoint protection
     app.add_middleware(APIKeyMiddleware, api_key=api_key)
-    
+
     # Mount MCP app to handle all other paths (including /mcp, /sse)
     app.mount("/", mcp_app)
-    
+
+    logger.info(f"[STARTUP] Starting uvicorn at t={time.time() - _module_start_time:.2f}s - listening on 0.0.0.0:{port}")
     uvicorn.run(app, host="0.0.0.0", port=port)
