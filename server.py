@@ -1,6 +1,6 @@
 """
 Crowd IT Unified MCP Server
-Centralized MCP server for Cloud Run - HaloPSA, Xero, Front, SharePoint, Quoter, Pax8, BigQuery, Maxotel VoIP, Ubuntu Server (SSH), CIPP (M365), Salesforce, n8n (Workflow Automation), GCloud CLI, and Azure integration.
+Centralized MCP server for Cloud Run - HaloPSA, Xero, Front, SharePoint, Quoter, Pax8, BigQuery, Maxotel VoIP, Ubuntu Server (SSH), CIPP (M365), Salesforce, n8n (Workflow Automation), GCloud CLI, Azure, and Dicker Data integration.
 """
 
 # Absolute first thing - print to both stdout and stderr
@@ -50,7 +50,7 @@ CLOUD_RUN_URL = os.getenv("CLOUD_RUN_URL", "https://crowdit-mcp-server-lypf4vkh4
 
 mcp = FastMCP(
     name="crowdit-mcp-server",
-    instructions="Crowd IT Unified MCP Server - HaloPSA, Xero, Front, SharePoint, Quoter, Pax8, BigQuery, Maxotel VoIP, Ubuntu Server (SSH), CIPP (M365), Salesforce, n8n (Workflow Automation), GCloud CLI, and Azure integration for MSP operations.",
+    instructions="Crowd IT Unified MCP Server - HaloPSA, Xero, Front, SharePoint, Quoter, Pax8, BigQuery, Maxotel VoIP, Ubuntu Server (SSH), CIPP (M365), Salesforce, n8n (Workflow Automation), GCloud CLI, Azure, and Dicker Data integration for MSP operations.",
     stateless_http=True  # Required for Cloud Run - enables stateless sessions
 )
 print(f"[STARTUP] FastMCP instance created at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
@@ -11238,6 +11238,494 @@ async def gcp_logs(
 
 
 # ============================================================================
+# Dicker Data Integration (IT Distributor)
+# ============================================================================
+
+class DickerDataConfig:
+    """Configuration for Dicker Data B2B API integration."""
+
+    def __init__(self):
+        # Try Secret Manager first, then fall back to environment variables
+        self.api_key = get_secret_sync("DICKER_API_KEY") or os.getenv("DICKER_API_KEY", "")
+        self.api_url = os.getenv("DICKER_API_URL", "https://b2b-api.dickerdata.com.au").rstrip("/")
+        self.account_code = os.getenv("DICKER_ACCOUNT_CODE", "")
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.api_key)
+
+    def headers(self) -> Dict[str, str]:
+        """Get headers for API requests."""
+        return {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+
+dicker_config = DickerDataConfig()
+
+
+def _format_dicker_product(product: Dict[str, Any]) -> str:
+    """Format a Dicker Data product for display."""
+    sku = product.get("sku", product.get("partNumber", product.get("productCode", "N/A")))
+    name = product.get("name", product.get("description", product.get("productName", "Unknown")))
+    vendor = product.get("vendor", product.get("manufacturer", product.get("brand", "N/A")))
+
+    # Price handling
+    price = product.get("price", product.get("unitPrice", product.get("rrp", 0)))
+    cost = product.get("cost", product.get("dealerPrice", product.get("buyPrice", 0)))
+
+    # Stock handling
+    stock = product.get("stock", product.get("quantity", product.get("qtyAvailable", product.get("availableStock", "N/A"))))
+    stock_status = product.get("stockStatus", product.get("availability", ""))
+
+    # ETA/Lead time
+    eta = product.get("eta", product.get("leadTime", product.get("expectedDate", "")))
+
+    lines = [f"### {name}"]
+    lines.append(f"**SKU:** `{sku}` | **Vendor:** {vendor}")
+
+    if cost:
+        lines.append(f"**Cost:** ${cost:,.2f}" if isinstance(cost, (int, float)) else f"**Cost:** {cost}")
+    if price:
+        lines.append(f"**RRP:** ${price:,.2f}" if isinstance(price, (int, float)) else f"**RRP:** {price}")
+
+    if stock != "N/A":
+        stock_info = f"**Stock:** {stock}"
+        if stock_status:
+            stock_info += f" ({stock_status})"
+        lines.append(stock_info)
+
+    if eta:
+        lines.append(f"**ETA:** {eta}")
+
+    # Additional details
+    category = product.get("category", product.get("productCategory", ""))
+    if category:
+        lines.append(f"**Category:** {category}")
+
+    return "\n".join(lines)
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def dicker_search_products(
+    query: str = Field(..., description="Search query (product name, SKU, or keyword)"),
+    vendor: Optional[str] = Field(None, description="Filter by vendor/manufacturer name"),
+    category: Optional[str] = Field(None, description="Filter by product category"),
+    in_stock_only: bool = Field(False, description="Only show products in stock"),
+    limit: int = Field(25, description="Max results (1-100)")
+) -> str:
+    """Search Dicker Data product catalog. Returns product details, pricing, and stock availability."""
+    if not dicker_config.is_configured:
+        return "Error: Dicker Data not configured. Set DICKER_API_KEY environment variable or secret."
+
+    try:
+        # Build search parameters
+        params = {
+            "search": query,
+            "pageSize": min(max(1, limit), 100)
+        }
+        if vendor:
+            params["vendor"] = vendor
+        if category:
+            params["category"] = category
+        if in_stock_only:
+            params["inStock"] = "true"
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"{dicker_config.api_url}/api/products/search",
+                headers=dicker_config.headers(),
+                params=params
+            )
+
+            if response.status_code == 401:
+                return "Error: Authentication failed. Check DICKER_API_KEY."
+            if response.status_code == 403:
+                return "Error: Access denied. Verify API key permissions."
+
+            response.raise_for_status()
+            data = response.json()
+
+        # Handle different response formats
+        products = data.get("products", data.get("items", data.get("results", data if isinstance(data, list) else [])))
+
+        if not products:
+            return f"No products found for '{query}'."
+
+        total = data.get("total", data.get("totalCount", len(products)))
+
+        results = [f"# Dicker Data Product Search\n"]
+        results.append(f"**Query:** {query} | **Results:** {len(products)} of {total}\n")
+
+        for product in products[:limit]:
+            results.append(_format_dicker_product(product))
+            results.append("---")
+
+        return "\n".join(results)
+
+    except httpx.HTTPStatusError as e:
+        return f"Error: API returned {e.response.status_code} - {e.response.text[:200]}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def dicker_get_product(
+    sku: str = Field(..., description="Product SKU/part number to look up")
+) -> str:
+    """Get detailed information for a specific Dicker Data product by SKU."""
+    if not dicker_config.is_configured:
+        return "Error: Dicker Data not configured. Set DICKER_API_KEY environment variable or secret."
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"{dicker_config.api_url}/api/products/{sku}",
+                headers=dicker_config.headers()
+            )
+
+            if response.status_code == 404:
+                return f"Product not found: {sku}"
+            if response.status_code == 401:
+                return "Error: Authentication failed. Check DICKER_API_KEY."
+
+            response.raise_for_status()
+            product = response.json()
+
+        # Format detailed product view
+        result = [f"# Product Details: {sku}\n"]
+        result.append(_format_dicker_product(product))
+
+        # Additional details if available
+        specs = product.get("specifications", product.get("specs", {}))
+        if specs:
+            result.append("\n## Specifications")
+            for key, value in specs.items():
+                result.append(f"- **{key}:** {value}")
+
+        desc = product.get("longDescription", product.get("fullDescription", ""))
+        if desc:
+            result.append(f"\n## Description\n{desc}")
+
+        return "\n".join(result)
+
+    except httpx.HTTPStatusError as e:
+        return f"Error: API returned {e.response.status_code} - {e.response.text[:200]}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def dicker_check_stock(
+    skus: str = Field(..., description="Comma-separated list of SKUs to check stock for")
+) -> str:
+    """Check real-time stock availability for one or more Dicker Data products."""
+    if not dicker_config.is_configured:
+        return "Error: Dicker Data not configured. Set DICKER_API_KEY environment variable or secret."
+
+    try:
+        sku_list = [s.strip() for s in skus.split(",") if s.strip()]
+        if not sku_list:
+            return "Error: No valid SKUs provided."
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Try batch endpoint first
+            response = await client.post(
+                f"{dicker_config.api_url}/api/products/stock",
+                headers=dicker_config.headers(),
+                json={"skus": sku_list}
+            )
+
+            if response.status_code == 404:
+                # Fall back to individual lookups
+                results = []
+                for sku in sku_list:
+                    try:
+                        resp = await client.get(
+                            f"{dicker_config.api_url}/api/products/{sku}/stock",
+                            headers=dicker_config.headers()
+                        )
+                        if resp.status_code == 200:
+                            results.append(resp.json())
+                        else:
+                            results.append({"sku": sku, "error": f"Status {resp.status_code}"})
+                    except Exception as e:
+                        results.append({"sku": sku, "error": str(e)})
+                stock_data = results
+            elif response.status_code == 401:
+                return "Error: Authentication failed. Check DICKER_API_KEY."
+            else:
+                response.raise_for_status()
+                data = response.json()
+                stock_data = data.get("items", data.get("products", data if isinstance(data, list) else [data]))
+
+        output = ["# Dicker Data Stock Check\n"]
+        output.append(f"**SKUs Checked:** {len(sku_list)}\n")
+
+        for item in stock_data:
+            sku = item.get("sku", item.get("partNumber", "Unknown"))
+            qty = item.get("quantity", item.get("stock", item.get("available", "N/A")))
+            status = item.get("status", item.get("stockStatus", item.get("availability", "")))
+            eta = item.get("eta", item.get("expectedDate", item.get("leadTime", "")))
+            warehouse = item.get("warehouse", item.get("location", ""))
+            error = item.get("error", "")
+
+            if error:
+                output.append(f"- **{sku}:** ⚠️ {error}")
+            else:
+                stock_icon = "✅" if (isinstance(qty, int) and qty > 0) or status.lower() in ["in stock", "available"] else "⚠️"
+                line = f"- **{sku}:** {stock_icon} {qty}"
+                if status:
+                    line += f" ({status})"
+                if eta:
+                    line += f" | ETA: {eta}"
+                if warehouse:
+                    line += f" | {warehouse}"
+                output.append(line)
+
+        return "\n".join(output)
+
+    except httpx.HTTPStatusError as e:
+        return f"Error: API returned {e.response.status_code} - {e.response.text[:200]}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def dicker_get_pricing(
+    skus: str = Field(..., description="Comma-separated list of SKUs to get pricing for")
+) -> str:
+    """Get current pricing for one or more Dicker Data products. Returns dealer cost and RRP."""
+    if not dicker_config.is_configured:
+        return "Error: Dicker Data not configured. Set DICKER_API_KEY environment variable or secret."
+
+    try:
+        sku_list = [s.strip() for s in skus.split(",") if s.strip()]
+        if not sku_list:
+            return "Error: No valid SKUs provided."
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            # Try batch pricing endpoint
+            response = await client.post(
+                f"{dicker_config.api_url}/api/products/pricing",
+                headers=dicker_config.headers(),
+                json={"skus": sku_list}
+            )
+
+            if response.status_code == 404:
+                # Fall back to individual lookups
+                results = []
+                for sku in sku_list:
+                    try:
+                        resp = await client.get(
+                            f"{dicker_config.api_url}/api/products/{sku}/price",
+                            headers=dicker_config.headers()
+                        )
+                        if resp.status_code == 200:
+                            data = resp.json()
+                            data["sku"] = sku
+                            results.append(data)
+                        else:
+                            results.append({"sku": sku, "error": f"Status {resp.status_code}"})
+                    except Exception as e:
+                        results.append({"sku": sku, "error": str(e)})
+                pricing_data = results
+            elif response.status_code == 401:
+                return "Error: Authentication failed. Check DICKER_API_KEY."
+            else:
+                response.raise_for_status()
+                data = response.json()
+                pricing_data = data.get("items", data.get("products", data if isinstance(data, list) else [data]))
+
+        output = ["# Dicker Data Pricing\n"]
+        output.append("| SKU | Cost | RRP | Currency |")
+        output.append("|-----|------|-----|----------|")
+
+        for item in pricing_data:
+            sku = item.get("sku", item.get("partNumber", "Unknown"))
+            cost = item.get("cost", item.get("dealerPrice", item.get("buyPrice", item.get("unitPrice", "N/A"))))
+            rrp = item.get("rrp", item.get("retailPrice", item.get("listPrice", "N/A")))
+            currency = item.get("currency", "AUD")
+            error = item.get("error", "")
+
+            if error:
+                output.append(f"| {sku} | ⚠️ Error | {error} | - |")
+            else:
+                cost_str = f"${cost:,.2f}" if isinstance(cost, (int, float)) else str(cost)
+                rrp_str = f"${rrp:,.2f}" if isinstance(rrp, (int, float)) else str(rrp)
+                output.append(f"| {sku} | {cost_str} | {rrp_str} | {currency} |")
+
+        return "\n".join(output)
+
+    except httpx.HTTPStatusError as e:
+        return f"Error: API returned {e.response.status_code} - {e.response.text[:200]}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def dicker_list_vendors() -> str:
+    """List all available vendors/manufacturers in Dicker Data catalog."""
+    if not dicker_config.is_configured:
+        return "Error: Dicker Data not configured. Set DICKER_API_KEY environment variable or secret."
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"{dicker_config.api_url}/api/vendors",
+                headers=dicker_config.headers()
+            )
+
+            if response.status_code == 401:
+                return "Error: Authentication failed. Check DICKER_API_KEY."
+            if response.status_code == 404:
+                # Try alternative endpoint
+                response = await client.get(
+                    f"{dicker_config.api_url}/api/products/vendors",
+                    headers=dicker_config.headers()
+                )
+
+            response.raise_for_status()
+            data = response.json()
+
+        vendors = data.get("vendors", data.get("items", data if isinstance(data, list) else []))
+
+        if not vendors:
+            return "No vendors found."
+
+        output = ["# Dicker Data Vendors\n"]
+        output.append(f"**Total Vendors:** {len(vendors)}\n")
+
+        # Sort vendors alphabetically
+        if vendors and isinstance(vendors[0], dict):
+            vendor_names = sorted([v.get("name", v.get("vendorName", str(v))) for v in vendors])
+        else:
+            vendor_names = sorted(vendors)
+
+        for name in vendor_names:
+            output.append(f"- {name}")
+
+        return "\n".join(output)
+
+    except httpx.HTTPStatusError as e:
+        return f"Error: API returned {e.response.status_code} - {e.response.text[:200]}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def dicker_list_categories() -> str:
+    """List all product categories available in Dicker Data catalog."""
+    if not dicker_config.is_configured:
+        return "Error: Dicker Data not configured. Set DICKER_API_KEY environment variable or secret."
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"{dicker_config.api_url}/api/categories",
+                headers=dicker_config.headers()
+            )
+
+            if response.status_code == 401:
+                return "Error: Authentication failed. Check DICKER_API_KEY."
+            if response.status_code == 404:
+                # Try alternative endpoint
+                response = await client.get(
+                    f"{dicker_config.api_url}/api/products/categories",
+                    headers=dicker_config.headers()
+                )
+
+            response.raise_for_status()
+            data = response.json()
+
+        categories = data.get("categories", data.get("items", data if isinstance(data, list) else []))
+
+        if not categories:
+            return "No categories found."
+
+        output = ["# Dicker Data Categories\n"]
+        output.append(f"**Total Categories:** {len(categories)}\n")
+
+        for cat in categories:
+            if isinstance(cat, dict):
+                name = cat.get("name", cat.get("categoryName", str(cat)))
+                count = cat.get("productCount", cat.get("count", ""))
+                if count:
+                    output.append(f"- **{name}** ({count} products)")
+                else:
+                    output.append(f"- {name}")
+            else:
+                output.append(f"- {cat}")
+
+        return "\n".join(output)
+
+    except httpx.HTTPStatusError as e:
+        return f"Error: API returned {e.response.status_code} - {e.response.text[:200]}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def dicker_search_by_vendor(
+    vendor: str = Field(..., description="Vendor/manufacturer name to search"),
+    query: Optional[str] = Field(None, description="Optional additional search term"),
+    in_stock_only: bool = Field(False, description="Only show products in stock"),
+    limit: int = Field(25, description="Max results (1-100)")
+) -> str:
+    """Search products from a specific vendor/manufacturer in Dicker Data."""
+    if not dicker_config.is_configured:
+        return "Error: Dicker Data not configured. Set DICKER_API_KEY environment variable or secret."
+
+    try:
+        params = {
+            "vendor": vendor,
+            "pageSize": min(max(1, limit), 100)
+        }
+        if query:
+            params["search"] = query
+        if in_stock_only:
+            params["inStock"] = "true"
+
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"{dicker_config.api_url}/api/products/search",
+                headers=dicker_config.headers(),
+                params=params
+            )
+
+            if response.status_code == 401:
+                return "Error: Authentication failed. Check DICKER_API_KEY."
+
+            response.raise_for_status()
+            data = response.json()
+
+        products = data.get("products", data.get("items", data.get("results", data if isinstance(data, list) else [])))
+
+        if not products:
+            return f"No products found for vendor '{vendor}'."
+
+        total = data.get("total", data.get("totalCount", len(products)))
+
+        results = [f"# Dicker Data - {vendor} Products\n"]
+        if query:
+            results.append(f"**Search:** {query} | **Results:** {len(products)} of {total}\n")
+        else:
+            results.append(f"**Results:** {len(products)} of {total}\n")
+
+        for product in products[:limit]:
+            results.append(_format_dicker_product(product))
+            results.append("---")
+
+        return "\n".join(results)
+
+    except httpx.HTTPStatusError as e:
+        return f"Error: API returned {e.response.status_code} - {e.response.text[:200]}"
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+# ============================================================================
 # Server Status
 # ============================================================================
 
@@ -11515,6 +12003,12 @@ async def server_status() -> str:
         if not os.getenv("SALESFORCE_REFRESH_TOKEN") and not get_secret_sync("SALESFORCE_REFRESH_TOKEN"):
             missing.append("REFRESH_TOKEN")
         lines.append(f"⚠️ **Salesforce:** Missing: {', '.join(missing)}")
+
+    # Dicker Data status
+    if dicker_config.is_configured:
+        lines.append(f"✅ **Dicker Data:** Configured ({dicker_config.api_url})")
+    else:
+        lines.append("⚠️ **Dicker Data:** Missing DICKER_API_KEY")
 
     lines.append(f"\n**Cloud Run URL:** {CLOUD_RUN_URL}")
     return "\n".join(lines)
