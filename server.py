@@ -1,6 +1,6 @@
 """
 Crowd IT Unified MCP Server
-Centralized MCP server for Cloud Run - HaloPSA, Xero, Front, SharePoint, Quoter, Pax8, BigQuery, Maxotel VoIP, Ubuntu Server (SSH), CIPP (M365), Salesforce, and n8n (Workflow Automation) integration.
+Centralized MCP server for Cloud Run - HaloPSA, Xero, Front, SharePoint, Quoter, Pax8, BigQuery, Maxotel VoIP, Ubuntu Server (SSH), CIPP (M365), Salesforce, n8n (Workflow Automation), and GCloud CLI integration.
 """
 
 # Absolute first thing - print to both stdout and stderr
@@ -47,7 +47,7 @@ CLOUD_RUN_URL = os.getenv("CLOUD_RUN_URL", "https://crowdit-mcp-server-lypf4vkh4
 
 mcp = FastMCP(
     name="crowdit-mcp-server",
-    instructions="Crowd IT Unified MCP Server - HaloPSA, Xero, Front, SharePoint, Quoter, Pax8, BigQuery, Maxotel VoIP, Ubuntu Server (SSH), CIPP (M365), Salesforce, and n8n (Workflow Automation) integration for MSP operations.",
+    instructions="Crowd IT Unified MCP Server - HaloPSA, Xero, Front, SharePoint, Quoter, Pax8, BigQuery, Maxotel VoIP, Ubuntu Server (SSH), CIPP (M365), Salesforce, n8n (Workflow Automation), and GCloud CLI integration for MSP operations.",
     stateless_http=True  # Required for Cloud Run - enables stateless sessions
 )
 print(f"[STARTUP] FastMCP instance created at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
@@ -10891,6 +10891,343 @@ async def salesforce_check_job(
     except Exception as e:
         logger.error(f"Salesforce check job error: {e}")
         return f"❌ Error: {str(e)}"
+
+
+# ============================================================================
+# Google Cloud CLI (gcloud) Integration
+# ============================================================================
+
+class GCloudConfig:
+    """GCloud CLI configuration - checks if gcloud is available and configured."""
+    def __init__(self):
+        self.project_id = os.getenv("GOOGLE_CLOUD_PROJECT", os.getenv("GCP_PROJECT_ID", os.getenv("BIGQUERY_PROJECT_ID", "")))
+        self._gcloud_available: Optional[bool] = None
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.project_id)
+
+    async def check_gcloud_available(self) -> bool:
+        """Check if gcloud CLI is available and authenticated."""
+        if self._gcloud_available is not None:
+            return self._gcloud_available
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "gcloud", "version", "--format=json",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=10)
+            self._gcloud_available = proc.returncode == 0
+            return self._gcloud_available
+        except Exception:
+            self._gcloud_available = False
+            return False
+
+gcloud_config = GCloudConfig()
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True})
+async def gcp_gcloud(
+    command: str = Field(..., description="gcloud command to execute (without 'gcloud' prefix). E.g., 'compute instances list --project=crowdmcp'"),
+    format: str = Field("json", description="Output format: json, table, yaml, text, csv, value, or none"),
+    timeout_seconds: int = Field(120, description="Command timeout in seconds (max 300)")
+) -> str:
+    """
+    Execute any gcloud CLI command. Full GCP admin access.
+
+    Examples:
+    - compute instances list --project=crowdmcp
+    - compute instances create my-vm --zone=australia-southeast1-b --machine-type=e2-medium
+    - compute firewall-rules create allow-ssh --allow=tcp:22
+    - run deploy my-service --image=gcr.io/project/image
+    - sql instances list
+    - container clusters list
+    - storage buckets list
+    - logging read --limit=50
+    """
+    if not gcloud_config.is_configured:
+        return "Error: GCloud not configured. Set GOOGLE_CLOUD_PROJECT environment variable."
+
+    if not await gcloud_config.check_gcloud_available():
+        return "Error: gcloud CLI is not available in this environment."
+
+    # Sanitize format parameter
+    valid_formats = ["json", "table", "yaml", "text", "csv", "value", "none"]
+    if format not in valid_formats:
+        format = "json"
+
+    # Build the full command
+    timeout_seconds = min(max(10, timeout_seconds), 300)
+    full_command = f"gcloud {command} --format={format}"
+
+    # Add project if not specified in command
+    if "--project=" not in command and gcloud_config.project_id:
+        full_command += f" --project={gcloud_config.project_id}"
+
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            full_command,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout_seconds)
+
+        stdout_text = stdout.decode("utf-8").strip() if stdout else ""
+        stderr_text = stderr.decode("utf-8").strip() if stderr else ""
+
+        if proc.returncode != 0:
+            error_msg = stderr_text or stdout_text or f"Command failed with exit code {proc.returncode}"
+            return f"**Error executing gcloud command:**\n```\n{error_msg}\n```"
+
+        if not stdout_text:
+            return "Command completed successfully (no output)."
+
+        # Format output nicely
+        if format == "json":
+            try:
+                data = json.loads(stdout_text)
+                return f"```json\n{json.dumps(data, indent=2)}\n```"
+            except json.JSONDecodeError:
+                return f"```\n{stdout_text}\n```"
+        else:
+            return f"```\n{stdout_text}\n```"
+
+    except asyncio.TimeoutError:
+        return f"Error: Command timed out after {timeout_seconds} seconds."
+    except Exception as e:
+        return f"Error executing gcloud command: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def gcp_list_vms(
+    project: Optional[str] = Field(None, description="GCP project ID (defaults to configured project)"),
+    zone: Optional[str] = Field(None, description="Filter by zone (e.g., australia-southeast1-b). If not specified, lists all zones."),
+    status: Optional[str] = Field(None, description="Filter by status: RUNNING, TERMINATED, STOPPED, STAGING, etc.")
+) -> str:
+    """List Compute Engine VMs with formatted output."""
+    if not gcloud_config.is_configured:
+        return "Error: GCloud not configured."
+
+    if not await gcloud_config.check_gcloud_available():
+        return "Error: gcloud CLI is not available."
+
+    project = project or gcloud_config.project_id
+    cmd = f"compute instances list --project={project}"
+    if zone:
+        cmd += f" --zones={zone}"
+
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            f"gcloud {cmd} --format=json",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+
+        if proc.returncode != 0:
+            return f"Error: {stderr.decode('utf-8')}"
+
+        vms = json.loads(stdout.decode("utf-8"))
+
+        if not vms:
+            return "No VMs found."
+
+        # Filter by status if specified
+        if status:
+            vms = [vm for vm in vms if vm.get("status", "").upper() == status.upper()]
+
+        if not vms:
+            return f"No VMs found with status '{status}'."
+
+        results = [f"## Compute Engine VMs ({project})\n"]
+
+        for vm in vms:
+            name = vm.get("name", "N/A")
+            vm_status = vm.get("status", "UNKNOWN")
+            machine_type = vm.get("machineType", "").split("/")[-1]
+            zone_name = vm.get("zone", "").split("/")[-1]
+
+            # Get internal and external IPs
+            internal_ip = "N/A"
+            external_ip = "N/A"
+            for nic in vm.get("networkInterfaces", []):
+                internal_ip = nic.get("networkIP", "N/A")
+                for access in nic.get("accessConfigs", []):
+                    if access.get("natIP"):
+                        external_ip = access.get("natIP")
+
+            # Status indicator
+            status_indicator = "[RUNNING]" if vm_status == "RUNNING" else "[STOPPED]" if vm_status in ["TERMINATED", "STOPPED"] else f"[{vm_status}]"
+
+            results.append(
+                f"{status_indicator} **{name}**\n"
+                f"  - Zone: `{zone_name}` | Type: `{machine_type}`\n"
+                f"  - Internal IP: `{internal_ip}` | External IP: `{external_ip}`"
+            )
+
+        return "\n\n".join(results)
+
+    except asyncio.TimeoutError:
+        return "Error: Command timed out."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
+async def gcp_vm_action(
+    instance: str = Field(..., description="VM instance name"),
+    action: str = Field(..., description="Action to perform: start, stop, reset, delete, suspend, resume"),
+    zone: str = Field(..., description="Zone where the instance is located (e.g., australia-southeast1-b)"),
+    project: Optional[str] = Field(None, description="GCP project ID (defaults to configured project)")
+) -> str:
+    """Perform an action on a Compute Engine VM (start, stop, reset, delete, suspend, resume)."""
+    if not gcloud_config.is_configured:
+        return "Error: GCloud not configured."
+
+    if not await gcloud_config.check_gcloud_available():
+        return "Error: gcloud CLI is not available."
+
+    valid_actions = ["start", "stop", "reset", "delete", "suspend", "resume"]
+    if action.lower() not in valid_actions:
+        return f"Error: Invalid action '{action}'. Valid actions: {', '.join(valid_actions)}"
+
+    project = project or gcloud_config.project_id
+    cmd = f"gcloud compute instances {action.lower()} {instance} --zone={zone} --project={project}"
+
+    # Add --quiet flag for destructive actions to skip confirmation
+    if action.lower() in ["delete", "stop", "reset"]:
+        cmd += " --quiet"
+
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+
+        if proc.returncode != 0:
+            error_msg = stderr.decode("utf-8") or stdout.decode("utf-8")
+            return f"Error performing {action} on {instance}: {error_msg}"
+
+        return f"Successfully initiated '{action}' on VM '{instance}' in zone '{zone}'."
+
+    except asyncio.TimeoutError:
+        return f"Error: Command timed out while trying to {action} VM."
+    except Exception as e:
+        return f"Error: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
+async def gcp_logs(
+    service: Optional[str] = Field(None, description="Filter by service/resource (e.g., 'cloud-run', 'compute', 'gke'). Maps to resource.type filter."),
+    severity: Optional[str] = Field(None, description="Minimum severity: DEBUG, INFO, NOTICE, WARNING, ERROR, CRITICAL, ALERT, EMERGENCY"),
+    limit: int = Field(50, description="Number of log entries to return (max 500)"),
+    resource_name: Optional[str] = Field(None, description="Filter by specific resource name (e.g., service name, instance name)"),
+    text_filter: Optional[str] = Field(None, description="Free text search in log payload"),
+    freshness: str = Field("1h", description="How far back to look: e.g., '1h', '30m', '1d', '7d'"),
+    project: Optional[str] = Field(None, description="GCP project ID (defaults to configured project)")
+) -> str:
+    """Query Google Cloud Logging with filters. Returns formatted log entries."""
+    if not gcloud_config.is_configured:
+        return "Error: GCloud not configured."
+
+    if not await gcloud_config.check_gcloud_available():
+        return "Error: gcloud CLI is not available."
+
+    project = project or gcloud_config.project_id
+    limit = min(max(1, limit), 500)
+
+    # Build filter expression
+    filters = []
+    if service:
+        # Map common service names to resource types
+        service_map = {
+            "cloud-run": "cloud_run_revision",
+            "cloudrun": "cloud_run_revision",
+            "run": "cloud_run_revision",
+            "compute": "gce_instance",
+            "gce": "gce_instance",
+            "vm": "gce_instance",
+            "gke": "k8s_container",
+            "kubernetes": "k8s_container",
+            "functions": "cloud_function",
+            "cloudfunctions": "cloud_function",
+            "sql": "cloudsql_database",
+            "cloudsql": "cloudsql_database",
+            "storage": "gcs_bucket",
+            "gcs": "gcs_bucket",
+        }
+        resource_type = service_map.get(service.lower(), service)
+        filters.append(f'resource.type="{resource_type}"')
+
+    if severity:
+        valid_severities = ["DEBUG", "INFO", "NOTICE", "WARNING", "ERROR", "CRITICAL", "ALERT", "EMERGENCY"]
+        if severity.upper() in valid_severities:
+            filters.append(f'severity>={severity.upper()}')
+
+    if resource_name:
+        filters.append(f'resource.labels.service_name="{resource_name}" OR resource.labels.instance_name="{resource_name}"')
+
+    if text_filter:
+        filters.append(f'textPayload:"{text_filter}" OR jsonPayload.message:"{text_filter}"')
+
+    filter_str = " AND ".join(filters) if filters else ""
+
+    cmd = f'gcloud logging read "{filter_str}" --limit={limit} --freshness={freshness} --project={project} --format=json'
+
+    try:
+        proc = await asyncio.create_subprocess_shell(
+            cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=60)
+
+        if proc.returncode != 0:
+            error_msg = stderr.decode("utf-8")
+            return f"Error querying logs: {error_msg}"
+
+        logs = json.loads(stdout.decode("utf-8")) if stdout else []
+
+        if not logs:
+            return "No log entries found matching the criteria."
+
+        results = [f"## Cloud Logging Results ({len(logs)} entries)\n"]
+
+        for entry in logs[:limit]:
+            timestamp = entry.get("timestamp", "N/A")
+            severity_level = entry.get("severity", "DEFAULT")
+            resource = entry.get("resource", {})
+            resource_type = resource.get("type", "unknown")
+
+            # Get the log message from various possible locations
+            message = (
+                entry.get("textPayload") or
+                entry.get("jsonPayload", {}).get("message") or
+                entry.get("jsonPayload", {}).get("msg") or
+                str(entry.get("jsonPayload", "No message"))
+            )
+
+            # Truncate long messages
+            if len(message) > 500:
+                message = message[:500] + "..."
+
+            severity_indicator = "[ERROR]" if severity_level in ["ERROR", "CRITICAL", "ALERT", "EMERGENCY"] else f"[{severity_level}]"
+
+            results.append(
+                f"{severity_indicator} `{timestamp}`\n"
+                f"  Resource: {resource_type}\n"
+                f"  {message}"
+            )
+
+        return "\n\n".join(results)
+
+    except asyncio.TimeoutError:
+        return "Error: Log query timed out."
+    except Exception as e:
+        return f"Error: {str(e)}"
 
 
 # ============================================================================
