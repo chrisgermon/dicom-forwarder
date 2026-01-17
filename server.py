@@ -161,7 +161,57 @@ class HaloPSAConfig:
             self._token_expiry = datetime.now() + timedelta(seconds=expires_in - 60)
             return self._access_token
 
-halopsa_config = HaloPSAConfig()
+# Lazy initialization: configs will be created in __main__ block after uvicorn starts listening
+# This prevents module import from blocking server startup on Cloud Run
+halopsa_config = None
+xero_config = None
+front_config = None
+sharepoint_config = None
+bigquery_config = None
+rds_config = None
+forticloud_config = None
+maxotel_config = None
+ubuntu_config = None
+visionrad_config = None
+cipp_config = None
+salesforce_config = None
+gcloud_config = None
+dicker_config = None
+ingram_config = None
+carbon_config = None
+ninjaone_config = None
+auvik_config = None
+
+def initialize_all_configs():
+    """Initialize all config objects after server startup."""
+    global halopsa_config, xero_config, front_config, sharepoint_config, bigquery_config
+    global rds_config, forticloud_config, maxotel_config, ubuntu_config, visionrad_config
+    global cipp_config, salesforce_config, gcloud_config, dicker_config, ingram_config
+    global carbon_config, ninjaone_config, auvik_config
+    
+    print(f"[STARTUP] Initializing configs at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
+    
+    halopsa_config = HaloPSAConfig()
+    xero_config = XeroConfig()
+    front_config = FrontConfig()
+    sharepoint_config = SharePointConfig()
+    bigquery_config = BigQueryConfig()
+    rds_config = RDSConfig()
+    forticloud_config = FortiCloudConfig()
+    maxotel_config = MaxotelConfig()
+    ubuntu_config = UbuntuConfig()
+    visionrad_config = VisionRadConfig()
+    cipp_config = CIPPConfig()
+    salesforce_config = SalesforceConfig()
+    gcloud_config = GCloudConfig()
+    dicker_config = DickerDataConfig()
+    ingram_config = IngramMicroConfig()
+    carbon_config = CarbonConfig()
+    ninjaone_config = NinjaOneConfig()
+    auvik_config = AuvikConfig()
+    # Quoter uses get_quoter_client() lazy loading, no need to initialize here
+    
+    print(f"[STARTUP] Configs initialized at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
 
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
 async def halopsa_search_tickets(
@@ -2047,8 +2097,6 @@ class XeroConfig:
             expires_in = data.get("expires_in", 1800)
             self._token_expiry = datetime.now() + timedelta(seconds=expires_in - 60)
             return self._access_token
-
-xero_config = XeroConfig()
 
 
 def _check_xero_response(response: httpx.Response) -> Optional[str]:
@@ -4292,8 +4340,6 @@ class FrontConfig:
     def headers(self):
         return {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
 
-front_config = FrontConfig()
-
 @mcp.tool(annotations={"readOnlyHint": True})
 async def front_list_inboxes() -> str:
     """List all Front inboxes (email, WhatsApp, etc.)."""
@@ -5072,8 +5118,6 @@ class SharePointConfig:
             expires_in = data.get("expires_in", 3600)
             self._token_expiry = datetime.now() + timedelta(seconds=expires_in - 60)
             return self._access_token
-
-sharepoint_config = SharePointConfig()
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
@@ -6347,7 +6391,6 @@ class BigQueryConfig:
 
         return self._client
 
-bigquery_config = BigQueryConfig()
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
@@ -6991,7 +7034,6 @@ class RDSConfig:
         return pymysql.connect(**config)
 
 
-rds_config = RDSConfig()
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
@@ -7350,7 +7392,6 @@ class FortiCloudConfig:
             return response.json()
 
 
-forticloud_config = FortiCloudConfig()
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
@@ -7859,7 +7900,6 @@ class MaxotelConfig:
             "key": self.api_key
         }
 
-maxotel_config = MaxotelConfig()
 
 
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
@@ -8612,7 +8652,6 @@ class UbuntuConfig:
 
         return None
 
-ubuntu_config = UbuntuConfig()
 
 
 async def _get_ssh_connection():
@@ -9217,7 +9256,6 @@ class VisionRadConfig:
 
         return None
 
-visionrad_config = VisionRadConfig()
 
 
 async def _get_visionrad_ssh_connection():
@@ -9825,7 +9863,6 @@ class CIPPConfig:
             return response.json()
 
 
-cipp_config = CIPPConfig()
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
@@ -10322,7 +10359,6 @@ class SalesforceConfig:
             return response.json()
 
 
-salesforce_config = SalesforceConfig()
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
@@ -10941,7 +10977,6 @@ class GCloudConfig:
             self._gcloud_available = False
             return False
 
-gcloud_config = GCloudConfig()
 
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False, "openWorldHint": True})
@@ -11282,7 +11317,6 @@ class DickerDataConfig:
             "Accept": "application/json"
         }
 
-dicker_config = DickerDataConfig()
 
 
 def _format_dicker_product(product: Dict[str, Any]) -> str:
@@ -11820,7 +11854,6 @@ class IngramMicroConfig:
         }
 
 
-ingram_config = IngramMicroConfig()
 
 
 def _format_ingram_product(product: Dict[str, Any]) -> str:
@@ -12783,7 +12816,6 @@ class CarbonConfig:
         return self.headers()
 
 
-carbon_config = CarbonConfig()
 
 
 # ============================================================================
@@ -12945,7 +12977,6 @@ class NinjaOneConfig:
             return response.json()
 
 
-ninjaone_config = NinjaOneConfig()
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
@@ -14854,7 +14885,6 @@ class AuvikConfig:
             return False
 
 
-auvik_config = AuvikConfig()
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
@@ -17955,6 +17985,9 @@ if __name__ == "__main__":
         print(f"[STARTUP] Lifespan startup at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
         # Initialize FastMCP's session manager via its lifespan handler
         async with mcp_app.lifespan(app):
+            # Initialize all config objects after FastMCP is ready
+            initialize_all_configs()
+            print(f"[STARTUP] Server ready to handle requests at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
             yield
         print(f"[STARTUP] Lifespan shutdown", file=sys.stderr, flush=True)
 
@@ -17993,6 +18026,7 @@ if __name__ == "__main__":
         host="0.0.0.0", 
         port=port,
         timeout_keep_alive=5,  # Reduce keep-alive timeout
+        timeout_notify=30,     # Timeout for ASGI startup notification
         access_log=True,       # Enable access logs for debugging
         log_level="info"       # Set appropriate log level
     )
