@@ -17995,22 +17995,11 @@ if __name__ == "__main__":
 
     @asynccontextmanager
     async def minimal_lifespan(app):
-        print(f"[STARTUP] Lifespan startup at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
+        """Lifespan handler - initialize FastMCP."""
         # Initialize FastMCP's session manager via its lifespan handler
+        # This is required for FastMCP 2.x
         async with mcp_app.lifespan(app):
-            print(f"[STARTUP] Server listening on port {port} at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
-            # Start lazy config initialization in background (non-blocking)
-            # This happens AFTER uvicorn binds to the port
-            asyncio.create_task(_init_configs_background())
             yield
-        print(f"[STARTUP] Lifespan shutdown", file=sys.stderr, flush=True)
-
-    async def _init_configs_background():
-        """Initialize configs in background after server starts listening."""
-        await asyncio.sleep(1.0)  # Wait to ensure port is ready and health checks can pass
-        print(f"[STARTUP] Starting background config initialization at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
-        _initialize_configs_once()
-        print(f"[STARTUP] Background config initialization complete at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
 
     app = Starlette(
         routes=[
