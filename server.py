@@ -1,6 +1,6 @@
 """
 Crowd IT Unified MCP Server
-Centralized MCP server for Cloud Run - HaloPSA, Xero, Front, SharePoint, Quoter, Pax8, BigQuery, Maxotel VoIP, Ubuntu Server (SSH), CIPP (M365), Salesforce, n8n (Workflow Automation), GCloud CLI, Azure, Dicker Data, Ingram Micro, and Aussie Broadband Carbon integration.
+Centralized MCP server for Cloud Run - HaloPSA, Xero, Front, SharePoint, Quoter, Pax8, BigQuery, Maxotel VoIP, Ubuntu Server (SSH), CIPP (M365), Salesforce, n8n (Workflow Automation), GCloud CLI, Azure, Dicker Data, Ingram Micro, Aussie Broadband Carbon, and NinjaOne (RMM) integration.
 """
 
 # Absolute first thing - print to both stdout and stderr
@@ -50,7 +50,7 @@ CLOUD_RUN_URL = os.getenv("CLOUD_RUN_URL", "https://crowdit-mcp-server-lypf4vkh4
 
 mcp = FastMCP(
     name="crowdit-mcp-server",
-    instructions="Crowd IT Unified MCP Server - HaloPSA, Xero, Front, SharePoint, Quoter, Pax8, BigQuery, Maxotel VoIP, Ubuntu Server (SSH), CIPP (M365), Salesforce, n8n (Workflow Automation), GCloud CLI, Azure, Dicker Data, Ingram Micro, and Aussie Broadband Carbon integration for MSP operations.",
+    instructions="Crowd IT Unified MCP Server - HaloPSA, Xero, Front, SharePoint, Quoter, Pax8, BigQuery, Maxotel VoIP, Ubuntu Server (SSH), CIPP (M365), Salesforce, n8n (Workflow Automation), GCloud CLI, Azure, Dicker Data, Ingram Micro, Aussie Broadband Carbon, and NinjaOne (RMM) integration for MSP operations.",
     stateless_http=True  # Required for Cloud Run - enables stateless sessions
 )
 print(f"[STARTUP] FastMCP instance created at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
@@ -12738,6 +12738,647 @@ class CarbonConfig:
 carbon_config = CarbonConfig()
 
 
+# ============================================================================
+# NinjaOne (NinjaRMM) Integration
+# ============================================================================
+
+class NinjaOneConfig:
+    """NinjaOne/NinjaRMM API configuration using OAuth2 client_credentials flow.
+
+    Environment variables:
+    - NINJAONE_CLIENT_ID: OAuth2 Client ID from NinjaOne API settings
+    - NINJAONE_CLIENT_SECRET: OAuth2 Client Secret
+    - NINJAONE_REGION: API region - 'app' (US), 'eu' (Europe), 'oc' (Oceania/Australia)
+
+    To set up NinjaOne API access:
+    1. Go to Administration > Apps > API
+    2. Click on Client App IDs > Add
+    3. Select "API Services (machine-to-machine)"
+    4. Grant required scopes (Monitoring, Management, Control as needed)
+    """
+
+    # Region to base URL mapping
+    REGION_URLS = {
+        "app": "https://app.ninjarmm.com",  # US
+        "us": "https://app.ninjarmm.com",   # US alias
+        "eu": "https://eu.ninjarmm.com",    # Europe
+        "oc": "https://oc.ninjarmm.com",    # Oceania (Australia/NZ)
+        "au": "https://oc.ninjarmm.com",    # Australia alias
+        "ca": "https://ca.ninjarmm.com",    # Canada
+    }
+
+    def __init__(self):
+        self._client_id: Optional[str] = None
+        self._client_secret: Optional[str] = None
+        self.region = os.getenv("NINJAONE_REGION", "oc").lower()  # Default to Oceania for Crowd IT
+        self._access_token: Optional[str] = None
+        self._token_expiry: Optional[datetime] = None
+
+    @property
+    def client_id(self) -> str:
+        """Get client ID from Secret Manager (with env var fallback)."""
+        if self._client_id:
+            return self._client_id
+        # Try Secret Manager first
+        secret = get_secret_sync("NINJAONE_CLIENT_ID")
+        if secret:
+            self._client_id = secret
+            return secret
+        # Fallback to environment variable
+        self._client_id = os.getenv("NINJAONE_CLIENT_ID", "")
+        return self._client_id
+
+    @property
+    def client_secret(self) -> str:
+        """Get client secret from Secret Manager (with env var fallback)."""
+        if self._client_secret:
+            return self._client_secret
+        # Try Secret Manager first
+        secret = get_secret_sync("NINJAONE_CLIENT_SECRET")
+        if secret:
+            self._client_secret = secret
+            return secret
+        # Fallback to environment variable
+        self._client_secret = os.getenv("NINJAONE_CLIENT_SECRET", "")
+        return self._client_secret
+
+    @property
+    def base_url(self) -> str:
+        """Get the API base URL based on region."""
+        return self.REGION_URLS.get(self.region, self.REGION_URLS["oc"])
+
+    @property
+    def token_url(self) -> str:
+        """Get the OAuth2 token endpoint URL."""
+        return f"{self.base_url}/oauth/token"
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.client_id and self.client_secret)
+
+    async def get_access_token(self) -> str:
+        """Get valid access token, requesting new one if expired."""
+        if self._access_token and self._token_expiry and datetime.now() < self._token_expiry:
+            return self._access_token
+
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                self.token_url,
+                data={
+                    "grant_type": "client_credentials",
+                    "client_id": self.client_id,
+                    "client_secret": self.client_secret,
+                    "scope": "monitoring management"
+                },
+                headers={"Content-Type": "application/x-www-form-urlencoded"},
+                timeout=30.0
+            )
+
+            if response.status_code != 200:
+                error_text = response.text[:500]
+                logger.error(f"NinjaOne auth failed: {response.status_code} - {error_text}")
+                raise Exception(f"NinjaOne authentication failed: {response.status_code} - {error_text}")
+
+            data = response.json()
+            self._access_token = data["access_token"]
+            # NinjaOne tokens typically expire in 1 hour (3600 seconds), refresh 5 mins early
+            expires_in = data.get("expires_in", 3600)
+            self._token_expiry = datetime.now() + timedelta(seconds=expires_in - 300)
+
+            logger.info(f"NinjaOne: Auth successful, token expires in {expires_in}s")
+            return self._access_token
+
+    async def api_request(self, method: str, endpoint: str, params: dict = None, json_data: dict = None) -> Any:
+        """Make authenticated request to NinjaOne API."""
+        token = await self.get_access_token()
+        url = f"{self.base_url}/api/v2/{endpoint.lstrip('/')}"
+
+        async with httpx.AsyncClient() as client:
+            response = await client.request(
+                method=method,
+                url=url,
+                params=params,
+                json=json_data,
+                headers={
+                    "Authorization": f"Bearer {token}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json"
+                },
+                timeout=60.0
+            )
+
+            if response.status_code == 401:
+                # Token expired, clear and retry
+                self._access_token = None
+                self._token_expiry = None
+                token = await self.get_access_token()
+                response = await client.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    json=json_data,
+                    headers={
+                        "Authorization": f"Bearer {token}",
+                        "Content-Type": "application/json",
+                        "Accept": "application/json"
+                    },
+                    timeout=60.0
+                )
+
+            if response.status_code >= 400:
+                error_text = response.text[:500]
+                logger.error(f"NinjaOne API error: {response.status_code} - {error_text}")
+                raise Exception(f"NinjaOne API error: {response.status_code} - {error_text}")
+
+            # Handle empty responses
+            if not response.text.strip():
+                return {}
+
+            return response.json()
+
+
+ninjaone_config = NinjaOneConfig()
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def ninjaone_get_organizations(
+    page_size: int = Field(100, description="Number of results per page (max 1000)"),
+    after: Optional[int] = Field(None, description="Cursor for pagination - organization ID to start after")
+) -> str:
+    """List all organizations (clients/customers) in NinjaOne.
+
+    Returns organization details including ID, name, description, and custom fields.
+    Use this to get an overview of managed clients or find specific organization IDs.
+    """
+    if not ninjaone_config.is_configured:
+        return "Error: NinjaOne not configured. Set NINJAONE_CLIENT_ID and NINJAONE_CLIENT_SECRET."
+
+    try:
+        params = {"pageSize": min(max(1, page_size), 1000)}
+        if after:
+            params["after"] = after
+
+        result = await ninjaone_config.api_request("GET", "organizations", params=params)
+
+        if not result:
+            return "No organizations found."
+
+        orgs = result if isinstance(result, list) else result.get("organizations", result.get("results", []))
+
+        if not orgs:
+            return "No organizations found."
+
+        lines = [f"# NinjaOne Organizations ({len(orgs)} shown)\n"]
+
+        for org in orgs:
+            org_id = org.get("id", "N/A")
+            name = org.get("name", "Unknown")
+            description = org.get("description", "")
+            node_approval = org.get("nodeApprovalMode", "")
+
+            lines.append(f"### {name}")
+            lines.append(f"**ID:** `{org_id}`")
+            if description:
+                lines.append(f"**Description:** {description}")
+            if node_approval:
+                lines.append(f"**Node Approval:** {node_approval}")
+
+            # Custom fields if present
+            custom_fields = org.get("fields", org.get("customFields", {}))
+            if custom_fields and isinstance(custom_fields, dict):
+                cf_items = [f"{k}: {v}" for k, v in list(custom_fields.items())[:5]]
+                if cf_items:
+                    lines.append(f"**Custom Fields:** {', '.join(cf_items)}")
+
+            lines.append("")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"NinjaOne get organizations error: {e}")
+        return f"Error listing organizations: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def ninjaone_get_devices(
+    org_id: Optional[int] = Field(None, description="Filter by organization ID"),
+    device_filter: Optional[str] = Field(None, description="Filter: 'all', 'windows', 'mac', 'linux', 'vmware', 'cloud'"),
+    page_size: int = Field(100, description="Number of results per page (max 1000)"),
+    after: Optional[int] = Field(None, description="Cursor for pagination - device ID to start after")
+) -> str:
+    """List devices/endpoints managed by NinjaOne.
+
+    Returns device information including name, OS, status, organization, and last contact time.
+    Can filter by organization or device type.
+    """
+    if not ninjaone_config.is_configured:
+        return "Error: NinjaOne not configured. Set NINJAONE_CLIENT_ID and NINJAONE_CLIENT_SECRET."
+
+    try:
+        params = {"pageSize": min(max(1, page_size), 1000)}
+        if after:
+            params["after"] = after
+        if device_filter and device_filter.lower() != "all":
+            params["df"] = device_filter.lower()
+
+        # Use organization-specific endpoint if org_id provided
+        if org_id:
+            endpoint = f"organization/{org_id}/devices"
+        else:
+            endpoint = "devices"
+
+        result = await ninjaone_config.api_request("GET", endpoint, params=params)
+
+        if not result:
+            return "No devices found."
+
+        devices = result if isinstance(result, list) else result.get("devices", result.get("results", []))
+
+        if not devices:
+            return "No devices found."
+
+        lines = [f"# NinjaOne Devices ({len(devices)} shown)\n"]
+
+        for device in devices:
+            device_id = device.get("id", "N/A")
+            name = device.get("systemName", device.get("dnsName", device.get("displayName", "Unknown")))
+            org_name = device.get("organizationName", device.get("organization", {}).get("name", "N/A"))
+            node_class = device.get("nodeClass", "Unknown")
+            os_info = device.get("os", {})
+            os_name = os_info.get("name", device.get("osName", "Unknown OS")) if isinstance(os_info, dict) else str(os_info)
+
+            # Status info
+            offline = device.get("offline", False)
+            status = "Offline" if offline else "Online"
+            status_icon = "🔴" if offline else "🟢"
+
+            # Last contact
+            last_contact = device.get("lastContact", device.get("lastContactTime", ""))
+            if last_contact and isinstance(last_contact, (int, float)):
+                try:
+                    last_contact = datetime.fromtimestamp(last_contact / 1000).strftime("%Y-%m-%d %H:%M")
+                except:
+                    last_contact = str(last_contact)
+
+            lines.append(f"### {status_icon} {name}")
+            lines.append(f"**ID:** `{device_id}` | **Type:** {node_class}")
+            lines.append(f"**Organization:** {org_name}")
+            lines.append(f"**OS:** {os_name}")
+            lines.append(f"**Status:** {status}")
+            if last_contact:
+                lines.append(f"**Last Contact:** {last_contact}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"NinjaOne get devices error: {e}")
+        return f"Error listing devices: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def ninjaone_get_device(
+    device_id: int = Field(..., description="Device ID to get details for")
+) -> str:
+    """Get detailed information about a specific device.
+
+    Returns comprehensive device details including hardware, software, networking, and custom fields.
+    """
+    if not ninjaone_config.is_configured:
+        return "Error: NinjaOne not configured. Set NINJAONE_CLIENT_ID and NINJAONE_CLIENT_SECRET."
+
+    try:
+        result = await ninjaone_config.api_request("GET", f"device/{device_id}")
+
+        if not result:
+            return f"Device {device_id} not found."
+
+        # Extract device info
+        name = result.get("systemName", result.get("dnsName", result.get("displayName", "Unknown")))
+        org_name = result.get("organizationName", "N/A")
+        node_class = result.get("nodeClass", "Unknown")
+
+        lines = [f"# Device: {name}\n"]
+        lines.append(f"**ID:** `{device_id}`")
+        lines.append(f"**Organization:** {org_name}")
+        lines.append(f"**Type:** {node_class}")
+
+        # OS Info
+        os_info = result.get("os", {})
+        if os_info:
+            os_name = os_info.get("name", "Unknown")
+            os_build = os_info.get("build", "")
+            lines.append(f"\n## Operating System")
+            lines.append(f"**Name:** {os_name}")
+            if os_build:
+                lines.append(f"**Build:** {os_build}")
+
+        # System Info
+        system = result.get("system", {})
+        if system:
+            lines.append(f"\n## Hardware")
+            manufacturer = system.get("manufacturer", "")
+            model = system.get("model", "")
+            if manufacturer or model:
+                lines.append(f"**Model:** {manufacturer} {model}".strip())
+
+            bios_serial = system.get("biosSerialNumber", "")
+            if bios_serial:
+                lines.append(f"**Serial:** {bios_serial}")
+
+            memory_gb = system.get("memory", 0) / (1024**3) if system.get("memory") else 0
+            if memory_gb > 0:
+                lines.append(f"**Memory:** {memory_gb:.1f} GB")
+
+        # Network Info
+        dns_name = result.get("dnsName", "")
+        ip_addresses = result.get("ipAddresses", result.get("publicIP", []))
+        if dns_name:
+            lines.append(f"\n## Network")
+            lines.append(f"**DNS Name:** {dns_name}")
+        if ip_addresses:
+            if isinstance(ip_addresses, list):
+                lines.append(f"**IP Addresses:** {', '.join(ip_addresses[:5])}")
+            else:
+                lines.append(f"**IP Address:** {ip_addresses}")
+
+        # Status
+        offline = result.get("offline", False)
+        last_contact = result.get("lastContact", "")
+        lines.append(f"\n## Status")
+        lines.append(f"**Online:** {'No' if offline else 'Yes'}")
+        if last_contact:
+            if isinstance(last_contact, (int, float)):
+                try:
+                    last_contact = datetime.fromtimestamp(last_contact / 1000).strftime("%Y-%m-%d %H:%M:%S")
+                except:
+                    pass
+            lines.append(f"**Last Contact:** {last_contact}")
+
+        # Custom fields
+        custom_fields = result.get("fields", result.get("customFields", {}))
+        if custom_fields and isinstance(custom_fields, dict) and len(custom_fields) > 0:
+            lines.append(f"\n## Custom Fields")
+            for key, value in list(custom_fields.items())[:10]:
+                lines.append(f"- **{key}:** {value}")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"NinjaOne get device error: {e}")
+        return f"Error getting device: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def ninjaone_get_alerts(
+    source_type: Optional[str] = Field(None, description="Filter by source: 'CONDITION', 'CONDITION_ACTIONSET', 'SYSTEM'"),
+    device_id: Optional[int] = Field(None, description="Filter by device ID"),
+    severity: Optional[str] = Field(None, description="Filter by severity: 'CRITICAL', 'MAJOR', 'MODERATE', 'MINOR', 'NONE'"),
+    page_size: int = Field(100, description="Number of results per page (max 1000)")
+) -> str:
+    """Get active alerts from NinjaOne.
+
+    Returns current alerts across all devices or filtered by device, severity, or source type.
+    """
+    if not ninjaone_config.is_configured:
+        return "Error: NinjaOne not configured. Set NINJAONE_CLIENT_ID and NINJAONE_CLIENT_SECRET."
+
+    try:
+        params = {"pageSize": min(max(1, page_size), 1000)}
+        if source_type:
+            params["sourceType"] = source_type.upper()
+        if severity:
+            params["severity"] = severity.upper()
+
+        # Use device-specific endpoint if device_id provided
+        if device_id:
+            endpoint = f"device/{device_id}/alerts"
+        else:
+            endpoint = "alerts"
+
+        result = await ninjaone_config.api_request("GET", endpoint, params=params)
+
+        if not result:
+            return "No active alerts."
+
+        alerts = result if isinstance(result, list) else result.get("alerts", result.get("results", []))
+
+        if not alerts:
+            return "No active alerts."
+
+        lines = [f"# NinjaOne Alerts ({len(alerts)} active)\n"]
+
+        severity_icons = {
+            "CRITICAL": "🔴",
+            "MAJOR": "🟠",
+            "MODERATE": "🟡",
+            "MINOR": "🔵",
+            "NONE": "⚪"
+        }
+
+        for alert in alerts:
+            alert_id = alert.get("id", alert.get("uid", "N/A"))
+            message = alert.get("message", alert.get("subject", "No message"))
+            sev = alert.get("severity", "NONE").upper()
+            icon = severity_icons.get(sev, "⚪")
+
+            device_name = alert.get("deviceName", alert.get("device", {}).get("systemName", "Unknown"))
+            org_name = alert.get("organizationName", "N/A")
+            source = alert.get("sourceType", "Unknown")
+
+            create_time = alert.get("createTime", alert.get("timestamp", ""))
+            if create_time and isinstance(create_time, (int, float)):
+                try:
+                    create_time = datetime.fromtimestamp(create_time / 1000).strftime("%Y-%m-%d %H:%M")
+                except:
+                    create_time = str(create_time)
+
+            lines.append(f"### {icon} {message[:80]}")
+            lines.append(f"**Alert ID:** `{alert_id}` | **Severity:** {sev}")
+            lines.append(f"**Device:** {device_name}")
+            lines.append(f"**Organization:** {org_name}")
+            lines.append(f"**Source:** {source}")
+            if create_time:
+                lines.append(f"**Created:** {create_time}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"NinjaOne get alerts error: {e}")
+        return f"Error getting alerts: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def ninjaone_get_device_activities(
+    device_id: int = Field(..., description="Device ID to get activities for"),
+    activity_type: Optional[str] = Field(None, description="Filter by type: 'ACTION', 'CONDITION', 'SYSTEM', etc."),
+    page_size: int = Field(50, description="Number of results per page (max 1000)")
+) -> str:
+    """Get activity log for a specific device.
+
+    Returns recent activities including system events, condition triggers, and actions taken.
+    """
+    if not ninjaone_config.is_configured:
+        return "Error: NinjaOne not configured. Set NINJAONE_CLIENT_ID and NINJAONE_CLIENT_SECRET."
+
+    try:
+        params = {"pageSize": min(max(1, page_size), 1000)}
+        if activity_type:
+            params["type"] = activity_type.upper()
+
+        result = await ninjaone_config.api_request("GET", f"device/{device_id}/activities", params=params)
+
+        if not result:
+            return f"No activities found for device {device_id}."
+
+        activities = result if isinstance(result, list) else result.get("activities", result.get("results", []))
+
+        if not activities:
+            return f"No activities found for device {device_id}."
+
+        lines = [f"# Device Activities (Device ID: {device_id})\n"]
+        lines.append(f"**Showing:** {len(activities)} activities\n")
+
+        for activity in activities:
+            act_type = activity.get("type", activity.get("activityType", "Unknown"))
+            status = activity.get("status", activity.get("statusCode", "N/A"))
+            message = activity.get("message", activity.get("subject", ""))
+
+            timestamp = activity.get("activityTime", activity.get("timestamp", ""))
+            if timestamp and isinstance(timestamp, (int, float)):
+                try:
+                    timestamp = datetime.fromtimestamp(timestamp / 1000).strftime("%Y-%m-%d %H:%M:%S")
+                except:
+                    timestamp = str(timestamp)
+
+            status_icon = "✅" if str(status).upper() in ["COMPLETED", "SUCCESS", "OK"] else "⚠️" if str(status).upper() in ["WARNING", "PENDING"] else "🔵"
+
+            lines.append(f"{status_icon} **{act_type}** - {status}")
+            if message:
+                lines.append(f"   {message[:100]}")
+            if timestamp:
+                lines.append(f"   _{timestamp}_")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"NinjaOne get device activities error: {e}")
+        return f"Error getting device activities: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def ninjaone_get_device_software(
+    device_id: int = Field(..., description="Device ID to get software inventory for")
+) -> str:
+    """Get installed software inventory for a specific device.
+
+    Returns list of installed applications with name, version, publisher, and install date.
+    """
+    if not ninjaone_config.is_configured:
+        return "Error: NinjaOne not configured. Set NINJAONE_CLIENT_ID and NINJAONE_CLIENT_SECRET."
+
+    try:
+        result = await ninjaone_config.api_request("GET", f"device/{device_id}/software")
+
+        if not result:
+            return f"No software inventory for device {device_id}."
+
+        software = result if isinstance(result, list) else result.get("software", result.get("results", []))
+
+        if not software:
+            return f"No software inventory for device {device_id}."
+
+        lines = [f"# Software Inventory (Device ID: {device_id})\n"]
+        lines.append(f"**Total Applications:** {len(software)}\n")
+
+        # Sort by name
+        software_sorted = sorted(software, key=lambda x: x.get("name", "").lower())
+
+        for sw in software_sorted[:100]:  # Limit to 100 entries
+            name = sw.get("name", sw.get("displayName", "Unknown"))
+            version = sw.get("version", "N/A")
+            publisher = sw.get("publisher", sw.get("vendor", ""))
+            install_date = sw.get("installDate", "")
+
+            line = f"- **{name}** v{version}"
+            if publisher:
+                line += f" ({publisher})"
+            lines.append(line)
+
+        if len(software) > 100:
+            lines.append(f"\n_...and {len(software) - 100} more applications_")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"NinjaOne get device software error: {e}")
+        return f"Error getting software inventory: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def ninjaone_search_devices(
+    query: str = Field(..., description="Search query - matches device name, DNS name, or organization"),
+    limit: int = Field(50, description="Maximum results to return")
+) -> str:
+    """Search for devices across all organizations.
+
+    Searches by device name, DNS name, or organization name.
+    """
+    if not ninjaone_config.is_configured:
+        return "Error: NinjaOne not configured. Set NINJAONE_CLIENT_ID and NINJAONE_CLIENT_SECRET."
+
+    try:
+        # Get all devices and filter client-side (NinjaOne API doesn't have a search endpoint)
+        result = await ninjaone_config.api_request("GET", "devices", params={"pageSize": 1000})
+
+        if not result:
+            return "No devices found."
+
+        devices = result if isinstance(result, list) else result.get("devices", result.get("results", []))
+
+        if not devices:
+            return "No devices found."
+
+        # Filter by query
+        query_lower = query.lower()
+        matches = []
+        for device in devices:
+            name = device.get("systemName", device.get("dnsName", device.get("displayName", ""))).lower()
+            dns = device.get("dnsName", "").lower()
+            org = device.get("organizationName", "").lower()
+
+            if query_lower in name or query_lower in dns or query_lower in org:
+                matches.append(device)
+
+        if not matches:
+            return f"No devices matching '{query}' found."
+
+        matches = matches[:limit]
+
+        lines = [f"# Search Results for '{query}' ({len(matches)} matches)\n"]
+
+        for device in matches:
+            device_id = device.get("id", "N/A")
+            name = device.get("systemName", device.get("dnsName", device.get("displayName", "Unknown")))
+            org_name = device.get("organizationName", "N/A")
+            node_class = device.get("nodeClass", "Unknown")
+            offline = device.get("offline", False)
+            status_icon = "🔴" if offline else "🟢"
+
+            lines.append(f"### {status_icon} {name}")
+            lines.append(f"**ID:** `{device_id}` | **Type:** {node_class}")
+            lines.append(f"**Organization:** {org_name}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"NinjaOne search devices error: {e}")
+        return f"Error searching devices: {str(e)}"
+
+
 def _format_carbon_service(service: Dict[str, Any]) -> str:
     """Format a Carbon service for display."""
     service_id = service.get("id", service.get("service_id", "N/A"))
@@ -13951,6 +14592,21 @@ async def server_status() -> str:
             missing.append("CLIENT_SECRET")
         lines.append(f"⚠️ **Ingram Micro:** Missing: {', '.join(missing) if missing else 'credentials'}")
 
+    # NinjaOne (NinjaRMM) status
+    if ninjaone_config.is_configured:
+        try:
+            await ninjaone_config.get_access_token()
+            lines.append(f"✅ **NinjaOne:** Connected ({ninjaone_config.base_url})")
+        except Exception as e:
+            lines.append(f"❌ **NinjaOne:** Auth failed - {str(e)[:50]}")
+    else:
+        missing = []
+        if not os.getenv("NINJAONE_CLIENT_ID") and not get_secret_sync("NINJAONE_CLIENT_ID"):
+            missing.append("CLIENT_ID")
+        if not os.getenv("NINJAONE_CLIENT_SECRET") and not get_secret_sync("NINJAONE_CLIENT_SECRET"):
+            missing.append("CLIENT_SECRET")
+        lines.append(f"⚠️ **NinjaOne:** Missing: {', '.join(missing)}")
+
     lines.append(f"\n**Cloud Run URL:** {CLOUD_RUN_URL}")
     return "\n".join(lines)
 
@@ -14789,6 +15445,14 @@ if __name__ == "__main__":
             "check_type": "api_key",
             "env_vars": ["DICKER_API_KEY"]
         },
+        {
+            "name": "NinjaOne",
+            "config": ninjaone_config,
+            "category": "RMM / Endpoint Management",
+            "check_type": "oauth",
+            "env_vars": ["NINJAONE_REGION"],
+            "auth_env_vars": ["NINJAONE_CLIENT_ID", "NINJAONE_CLIENT_SECRET"]
+        },
     ]
 
     async def check_platform_status(platform: dict) -> dict:
@@ -14872,6 +15536,9 @@ if __name__ == "__main__":
         elif name == "Dicker Data":
             result["endpoint"] = "https://b2b-api.dickerdata.com.au"
             result["api_version"] = "v1"
+        elif name == "NinjaOne":
+            result["endpoint"] = getattr(config, 'base_url', 'https://oc.ninjarmm.com')
+            result["api_version"] = "v2"
 
         if not config.is_configured:
             # Build missing env vars message
