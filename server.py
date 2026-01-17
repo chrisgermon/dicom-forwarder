@@ -161,7 +161,7 @@ class HaloPSAConfig:
             self._token_expiry = datetime.now() + timedelta(seconds=expires_in - 60)
             return self._access_token
 
-# Lazy initialization: configs will be created in __main__ block after uvicorn starts listening
+# Lazy initialization: configs will be created on first use
 # This prevents module import from blocking server startup on Cloud Run
 halopsa_config = None
 xero_config = None
@@ -182,36 +182,48 @@ carbon_config = None
 ninjaone_config = None
 auvik_config = None
 
-def initialize_all_configs():
-    """Initialize all config objects after server startup."""
+_configs_initialized = False
+
+def _initialize_configs_once():
+    """Initialize all configs once on first use."""
     global halopsa_config, xero_config, front_config, sharepoint_config, bigquery_config
     global rds_config, forticloud_config, maxotel_config, ubuntu_config, visionrad_config
     global cipp_config, salesforce_config, gcloud_config, dicker_config, ingram_config
-    global carbon_config, ninjaone_config, auvik_config
+    global carbon_config, ninjaone_config, auvik_config, _configs_initialized
     
-    print(f"[STARTUP] Initializing configs at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
+    if _configs_initialized:
+        return
     
-    halopsa_config = HaloPSAConfig()
-    xero_config = XeroConfig()
-    front_config = FrontConfig()
-    sharepoint_config = SharePointConfig()
-    bigquery_config = BigQueryConfig()
-    rds_config = RDSConfig()
-    forticloud_config = FortiCloudConfig()
-    maxotel_config = MaxotelConfig()
-    ubuntu_config = UbuntuConfig()
-    visionrad_config = VisionRadConfig()
-    cipp_config = CIPPConfig()
-    salesforce_config = SalesforceConfig()
-    gcloud_config = GCloudConfig()
-    dicker_config = DickerDataConfig()
-    ingram_config = IngramMicroConfig()
-    carbon_config = CarbonConfig()
-    ninjaone_config = NinjaOneConfig()
-    auvik_config = AuvikConfig()
-    # Quoter uses get_quoter_client() lazy loading, no need to initialize here
+    _configs_initialized = True
     
-    print(f"[STARTUP] Configs initialized at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
+    try:
+        halopsa_config = HaloPSAConfig()
+        xero_config = XeroConfig()
+        front_config = FrontConfig()
+        sharepoint_config = SharePointConfig()
+        bigquery_config = BigQueryConfig()
+        rds_config = RDSConfig()
+        forticloud_config = FortiCloudConfig()
+        maxotel_config = MaxotelConfig()
+        ubuntu_config = UbuntuConfig()
+        visionrad_config = VisionRadConfig()
+        cipp_config = CIPPConfig()
+        salesforce_config = SalesforceConfig()
+        gcloud_config = GCloudConfig()
+        dicker_config = DickerDataConfig()
+        ingram_config = IngramMicroConfig()
+        carbon_config = CarbonConfig()
+        ninjaone_config = NinjaOneConfig()
+        auvik_config = AuvikConfig()
+    except Exception as e:
+        logger.error(f"Error during lazy config initialization: {e}", exc_info=True)
+
+# For backwards compatibility, also keep the original function but make it non-blocking
+def initialize_all_configs():
+    """Initialize all config objects (called after uvicorn starts)."""
+    _initialize_configs_once()
+
+
 
 @mcp.tool(annotations={"readOnlyHint": True, "openWorldHint": True})
 async def halopsa_search_tickets(
@@ -15850,6 +15862,7 @@ if __name__ == "__main__":
         return HTMLResponse("<html><body><h1>Crowd IT MCP Server</h1><p>MCP endpoint: /mcp</p></body></html>")
     
     async def health_route(request):
+        # Just return OK immediately - configs will initialize lazily in background
         return PlainTextResponse("OK")
     
     async def callback_route(request):
@@ -17985,11 +17998,19 @@ if __name__ == "__main__":
         print(f"[STARTUP] Lifespan startup at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
         # Initialize FastMCP's session manager via its lifespan handler
         async with mcp_app.lifespan(app):
-            # Initialize all config objects after FastMCP is ready
-            initialize_all_configs()
-            print(f"[STARTUP] Server ready to handle requests at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
+            print(f"[STARTUP] Server listening on port {port} at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
+            # Start lazy config initialization in background (non-blocking)
+            # This happens AFTER uvicorn binds to the port
+            asyncio.create_task(_init_configs_background())
             yield
         print(f"[STARTUP] Lifespan shutdown", file=sys.stderr, flush=True)
+
+    async def _init_configs_background():
+        """Initialize configs in background after server starts listening."""
+        await asyncio.sleep(1.0)  # Wait to ensure port is ready and health checks can pass
+        print(f"[STARTUP] Starting background config initialization at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
+        _initialize_configs_once()
+        print(f"[STARTUP] Background config initialization complete at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
 
     app = Starlette(
         routes=[
@@ -18016,6 +18037,10 @@ if __name__ == "__main__":
     # (This should no longer be needed with the refactored approach above)
     print(f"[STARTUP] Skipping quick socket server shutdown at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
 
+    # NOTE: Configs are initialized lazily on first use to avoid blocking startup
+    # This allows uvicorn to bind to port 8080 immediately and respond to health checks
+    # while background initialization continues
+    
     print(f"[STARTUP] Starting uvicorn at t={time.time() - _module_start_time:.3f}s - listening on 0.0.0.0:{port}", file=sys.stderr, flush=True)
     sys.stderr.flush()
     sys.stdout.flush()
