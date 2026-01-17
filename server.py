@@ -4413,15 +4413,27 @@ async def front_list_tags() -> str:
 
 class N8NConfig:
     def __init__(self):
-        # Try Secret Manager first, then fall back to environment variables
-        self.api_url = (get_secret_sync("N8N_API_URL") or os.getenv("N8N_API_URL", "")).rstrip("/")
-        self.api_key = get_secret_sync("N8N_API_KEY") or os.getenv("N8N_API_KEY", "")
+        # Load from environment first; defer Secret Manager until needed
+        self.api_url = os.getenv("N8N_API_URL", "").rstrip("/")
+        self.api_key = os.getenv("N8N_API_KEY", "")
+        self._secrets_loaded = False
+
+    def _load_secrets(self) -> None:
+        if self._secrets_loaded:
+            return
+        if not self.api_url:
+            self.api_url = (get_secret_sync("N8N_API_URL") or "").rstrip("/")
+        if not self.api_key:
+            self.api_key = get_secret_sync("N8N_API_KEY") or ""
+        self._secrets_loaded = True
 
     @property
     def is_configured(self) -> bool:
+        self._load_secrets()
         return all([self.api_url, self.api_key])
 
     def headers(self):
+        self._load_secrets()
         return {"X-N8N-API-KEY": self.api_key, "Content-Type": "application/json", "Accept": "application/json"}
 
 n8n_config = N8NConfig()
@@ -11243,17 +11255,27 @@ class DickerDataConfig:
     """Configuration for Dicker Data B2B API integration."""
 
     def __init__(self):
-        # Try Secret Manager first, then fall back to environment variables
-        self.api_key = get_secret_sync("DICKER_API_KEY") or os.getenv("DICKER_API_KEY", "")
+        # Load from environment first; defer Secret Manager until needed
+        self.api_key = os.getenv("DICKER_API_KEY", "")
         self.api_url = os.getenv("DICKER_API_URL", "https://b2b-api.dickerdata.com.au").rstrip("/")
         self.account_code = os.getenv("DICKER_ACCOUNT_CODE", "")
+        self._secrets_loaded = False
+
+    def _load_secrets(self) -> None:
+        if self._secrets_loaded:
+            return
+        if not self.api_key:
+            self.api_key = get_secret_sync("DICKER_API_KEY") or ""
+        self._secrets_loaded = True
 
     @property
     def is_configured(self) -> bool:
+        self._load_secrets()
         return bool(self.api_key)
 
     def headers(self) -> Dict[str, str]:
         """Get headers for API requests."""
+        self._load_secrets()
         return {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -11731,21 +11753,35 @@ class IngramMicroConfig:
     """Configuration for Ingram Micro Reseller API v6 integration (Australia)."""
 
     def __init__(self):
-        # Try Secret Manager first, then fall back to environment variables
-        self.client_id = get_secret_sync("INGRAM_CLIENT_ID") or os.getenv("INGRAM_CLIENT_ID", "")
-        self.client_secret = get_secret_sync("INGRAM_CLIENT_SECRET") or os.getenv("INGRAM_CLIENT_SECRET", "")
-        self.customer_number = get_secret_sync("INGRAM_CUSTOMER_NUMBER") or os.getenv("INGRAM_CUSTOMER_NUMBER", "")
+        # Load from environment first; defer Secret Manager until needed
+        self.client_id = os.getenv("INGRAM_CLIENT_ID", "")
+        self.client_secret = os.getenv("INGRAM_CLIENT_SECRET", "")
+        self.customer_number = os.getenv("INGRAM_CUSTOMER_NUMBER", "")
         self.api_url = os.getenv("INGRAM_API_URL", "https://api.ingrammicro.com:443").rstrip("/")
         self.country_code = os.getenv("INGRAM_COUNTRY_CODE", "AU")  # Australia by default
         self._access_token: Optional[str] = None
         self._token_expiry: Optional[datetime] = None
+        self._secrets_loaded = False
+
+    def _load_secrets(self) -> None:
+        if self._secrets_loaded:
+            return
+        if not self.client_id:
+            self.client_id = get_secret_sync("INGRAM_CLIENT_ID") or ""
+        if not self.client_secret:
+            self.client_secret = get_secret_sync("INGRAM_CLIENT_SECRET") or ""
+        if not self.customer_number:
+            self.customer_number = get_secret_sync("INGRAM_CUSTOMER_NUMBER") or ""
+        self._secrets_loaded = True
 
     @property
     def is_configured(self) -> bool:
+        self._load_secrets()
         return bool(self.client_id and self.client_secret)
 
     async def get_access_token(self) -> str:
         """Get OAuth2 access token using client credentials flow."""
+        self._load_secrets()
         # Check if we have a valid cached token
         if self._access_token and self._token_expiry:
             if datetime.now(timezone.utc) < self._token_expiry - timedelta(minutes=5):
@@ -12654,20 +12690,32 @@ class CarbonConfig:
     """Configuration for Aussie Broadband Carbon API integration."""
 
     def __init__(self):
-        # Try Secret Manager first, then fall back to environment variables
-        self.username = get_secret_sync("CARBON_USERNAME") or os.getenv("CARBON_USERNAME", "")
-        self.password = get_secret_sync("CARBON_PASSWORD") or os.getenv("CARBON_PASSWORD", "")
+        # Load from environment first; defer Secret Manager until needed
+        self.username = os.getenv("CARBON_USERNAME", "")
+        self.password = os.getenv("CARBON_PASSWORD", "")
         self.api_url = os.getenv("CARBON_API_URL", "https://api.carbon.aussiebroadband.com.au").rstrip("/")
         self._access_token: Optional[str] = None
         self._refresh_token: Optional[str] = None
         self._token_expiry: Optional[datetime] = None
+        self._secrets_loaded = False
+
+    def _load_secrets(self) -> None:
+        if self._secrets_loaded:
+            return
+        if not self.username:
+            self.username = get_secret_sync("CARBON_USERNAME") or ""
+        if not self.password:
+            self.password = get_secret_sync("CARBON_PASSWORD") or ""
+        self._secrets_loaded = True
 
     @property
     def is_configured(self) -> bool:
+        self._load_secrets()
         return bool(self.username and self.password)
 
     async def get_access_token(self) -> str:
         """Get a valid access token, refreshing if necessary."""
+        self._load_secrets()
         # Return cached token if still valid
         if self._access_token and self._token_expiry and datetime.now() < self._token_expiry:
             return self._access_token
