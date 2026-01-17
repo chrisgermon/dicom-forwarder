@@ -4624,22 +4624,22 @@ async def n8n_deactivate_workflow(
 
 @mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": False})
 async def n8n_create_workflow(
-    name: str = ...,
-    nodes: Optional[str] = ...,
-    connections: Optional[str] = ...
+    name: str = Field(..., description="Name of the new workflow"),
+    nodes: Optional[str] = Field(None, description="JSON string of nodes array (optional, creates empty workflow if not provided)"),
+    connections: Optional[str] = Field(None, description="JSON string of connections object (optional)")
 ) -> str:
-    """Create a new n8n workflow."""
+    """Create a new n8n workflow. Workflows are created inactive by default - use n8n_activate_workflow to activate."""
     if not n8n_config.is_configured:
         return "Error: n8n not configured."
     try:
         import json as json_module
 
         workflow_data = {
-    "name": name,
-    "nodes": ...,
-    "connections": ...,
-    "settings": {}
-}
+            "name": name,
+            "nodes": json_module.loads(nodes) if nodes else [],
+            "connections": json_module.loads(connections) if connections else {},
+            "settings": {}
+        }
 
         async with httpx.AsyncClient() as client:
             response = await client.post(
