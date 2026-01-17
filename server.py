@@ -12606,8 +12606,8 @@ async def ingram_create_order(
     ship_to_city: str = Field(..., description="Shipping city"),
     ship_to_state: str = Field(..., description="Shipping state/province"),
     ship_to_postal_code: str = Field(..., description="Shipping postal/ZIP code"),
-    ship_to_country: str = Field("AU", description="Shipping country code (default: AU)"),
     lines_json: str = Field(..., description="JSON array of line items: [{\"ingramPartNumber\": \"ABC123\", \"quantity\": 1}, ...]"),
+    ship_to_country: str = Field("AU", description="Shipping country code (default: AU)"),
     ship_to_address2: Optional[str] = Field(None, description="Shipping address line 2"),
     special_instructions: Optional[str] = Field(None, description="Special order instructions"),
     notes: Optional[str] = Field(None, description="Order notes")
