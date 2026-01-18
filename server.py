@@ -56,7 +56,10 @@ mcp = FastMCP(
 print(f"[STARTUP] FastMCP instance created at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
 
 # Register Azure tools
-register_azure_tools(mcp)
+try:
+    register_azure_tools(mcp)
+except Exception as e:
+    print(f'[STARTUP] Azure tools registration failed (non-critical): {e}', file=sys.stderr, flush=True)
 print(f"[STARTUP] Azure tools registered at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
 
 # ============================================================================
@@ -18046,3 +18049,4 @@ if __name__ == "__main__":
         access_log=True,       # Enable access logs for debugging
         log_level="info"       # Set appropriate log level
     )
+
