@@ -17882,6 +17882,51 @@ if __name__ == "__main__":
             "services": services,
         })
 
+    # ============================================================================
+    # Cron Scheduler Routes
+    # ============================================================================
+    
+    from app.tools.cron_manager import CronManager
+    cron_manager = CronManager()
+
+    async def scheduler_page_route(request):
+        try:
+            with open("app/templates/scheduler.html", "r", encoding="utf-8") as f:
+                content = f.read()
+            return HTMLResponse(content)
+        except Exception as e:
+            return PlainTextResponse(f"Error loading template: {e}", status_code=500)
+
+    async def api_scheduler_list_jobs(request):
+        try:
+            jobs = await cron_manager.list_jobs()
+            return JSONResponse(jobs)
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    async def api_scheduler_run_job(request):
+        try:
+            body = await request.json()
+            command = body.get("command")
+            if not command:
+                return JSONResponse({"error": "Missing command"}, status_code=400)
+            output = await cron_manager.run_job(command)
+            return JSONResponse({"output": output})
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
+    async def api_scheduler_update_job(request):
+        try:
+            body = await request.json()
+            success = await cron_manager.update_job(
+                body.get("old_raw"),
+                body.get("new_schedule"),
+                body.get("new_command")
+            )
+            return JSONResponse({"success": success})
+        except Exception as e:
+            return JSONResponse({"error": str(e)}, status_code=500)
+
     # Get API key for middleware (lazy load from Secret Manager if not in env)
     api_key = os.getenv("MCP_API_KEY")  # Don't call Secret Manager at startup
     print(f"[STARTUP] API key check at t={time.time() - _module_start_time:.3f}s (from env: {api_key is not None})", file=sys.stderr, flush=True)
@@ -17948,4 +17993,5 @@ if __name__ == "__main__":
         access_log=False,      # Disable access logs
         log_level="info"       # Set appropriate log level
     )
+
 
