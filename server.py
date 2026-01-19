@@ -1,6 +1,6 @@
 """
 Crowd IT Unified MCP Server
-Centralized MCP server for Cloud Run - HaloPSA, Xero, Front, SharePoint, Quoter, Pax8, BigQuery, Maxotel VoIP, Ubuntu Server (SSH), CIPP (M365), Salesforce, n8n (Workflow Automation), GCloud CLI, Azure, Dicker Data, Ingram Micro, Aussie Broadband Carbon, NinjaOne (RMM), and Auvik (Network Management) integration.
+Centralized MCP server for Cloud Run - HaloPSA, Xero, Front, SharePoint, Quoter, Pax8, BigQuery, Maxotel VoIP, Ubuntu Server (SSH), CIPP (M365), Salesforce, n8n (Workflow Automation), GCloud CLI, Azure, Dicker Data, Ingram Micro, Aussie Broadband Carbon, NinjaOne (RMM), Auvik (Network Management), and Metabase (Business Intelligence) integration.
 """
 
 # Absolute first thing - print to both stdout and stderr
@@ -50,7 +50,7 @@ CLOUD_RUN_URL = os.getenv("CLOUD_RUN_URL", "https://crowdit-mcp-server-lypf4vkh4
 
 mcp = FastMCP(
     name="crowdit-mcp-server",
-    instructions="Crowd IT Unified MCP Server - HaloPSA, Xero, Front, SharePoint, Quoter, Pax8, BigQuery, Maxotel VoIP, Ubuntu Server (SSH), CIPP (M365), Salesforce, n8n (Workflow Automation), GCloud CLI, Azure, Dicker Data, Ingram Micro, Aussie Broadband Carbon, NinjaOne (RMM), and Auvik (Network Management) integration for MSP operations.",
+    instructions="Crowd IT Unified MCP Server - HaloPSA, Xero, Front, SharePoint, Quoter, Pax8, BigQuery, Maxotel VoIP, Ubuntu Server (SSH), CIPP (M365), Salesforce, n8n (Workflow Automation), GCloud CLI, Azure, Dicker Data, Ingram Micro, Aussie Broadband Carbon, NinjaOne (RMM), Auvik (Network Management), and Metabase (Business Intelligence) integration for MSP operations.",
     stateless_http=True  # Required for Cloud Run - enables stateless sessions
 )
 print(f"[STARTUP] FastMCP instance created at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
@@ -133,6 +133,7 @@ ingram_config = None
 carbon_config = None
 ninjaone_config = None
 auvik_config = None
+metabase_config = None
 
 _configs_initialized = False
 
@@ -141,7 +142,7 @@ def _initialize_configs_once():
     global halopsa_config, xero_config, front_config, sharepoint_config, bigquery_config
     global rds_config, forticloud_config, maxotel_config, ubuntu_config, visionrad_config
     global cipp_config, salesforce_config, gcloud_config, dicker_config, ingram_config
-    global carbon_config, ninjaone_config, auvik_config, _configs_initialized
+    global carbon_config, ninjaone_config, auvik_config, metabase_config, _configs_initialized
     
     if _configs_initialized:
         return
@@ -167,6 +168,7 @@ def _initialize_configs_once():
         carbon_config = CarbonConfig()
         ninjaone_config = NinjaOneConfig()
         auvik_config = AuvikConfig()
+        metabase_config = MetabaseConfig()
     except Exception as e:
         logger.error(f"Error during lazy config initialization: {e}", exc_info=True)
 
@@ -15413,6 +15415,709 @@ async def auvik_search_devices(
 
 
 # ============================================================================
+# Metabase Business Intelligence Integration
+# ============================================================================
+
+class MetabaseConfig:
+    """Metabase BI platform API configuration.
+
+    Environment variables:
+    - METABASE_URL: Base URL of your Metabase instance (e.g., https://metabase.example.com)
+    - METABASE_USERNAME: Metabase login email/username
+    - METABASE_PASSWORD: Metabase login password
+    - METABASE_API_KEY: Alternative to username/password - Metabase API key (if supported)
+
+    Authentication:
+    Metabase uses session-based authentication. This config will authenticate
+    and cache the session token for reuse.
+    """
+
+    def __init__(self):
+        self._url: Optional[str] = None
+        self._username: Optional[str] = None
+        self._password: Optional[str] = None
+        self._api_key: Optional[str] = None
+        self._session_token: Optional[str] = None
+        self._token_expiry: Optional[datetime] = None
+
+    @property
+    def url(self) -> str:
+        """Get Metabase URL from Secret Manager (with env var fallback)."""
+        if self._url:
+            return self._url
+        secret = get_secret_sync("METABASE_URL")
+        if secret:
+            self._url = secret.rstrip("/")
+            return self._url
+        self._url = os.getenv("METABASE_URL", "").rstrip("/")
+        return self._url
+
+    @property
+    def username(self) -> str:
+        """Get username from Secret Manager (with env var fallback)."""
+        if self._username:
+            return self._username
+        secret = get_secret_sync("METABASE_USERNAME")
+        if secret:
+            self._username = secret
+            return secret
+        self._username = os.getenv("METABASE_USERNAME", "")
+        return self._username
+
+    @property
+    def password(self) -> str:
+        """Get password from Secret Manager (with env var fallback)."""
+        if self._password:
+            return self._password
+        secret = get_secret_sync("METABASE_PASSWORD")
+        if secret:
+            self._password = secret
+            return secret
+        self._password = os.getenv("METABASE_PASSWORD", "")
+        return self._password
+
+    @property
+    def api_key(self) -> str:
+        """Get API key from Secret Manager (with env var fallback)."""
+        if self._api_key:
+            return self._api_key
+        secret = get_secret_sync("METABASE_API_KEY")
+        if secret:
+            self._api_key = secret
+            return secret
+        self._api_key = os.getenv("METABASE_API_KEY", "")
+        return self._api_key
+
+    @property
+    def is_configured(self) -> bool:
+        """Check if Metabase is configured with either username/password or API key."""
+        return bool(self.url) and (
+            (self.username and self.password) or self.api_key
+        )
+
+    async def get_session_token(self) -> str:
+        """Get a valid session token, authenticating if needed."""
+        # Check if we have a valid cached token
+        if self._session_token and self._token_expiry and datetime.now() < self._token_expiry:
+            return self._session_token
+
+        # If using API key, use that instead
+        if self.api_key:
+            return self.api_key
+
+        # Authenticate with username/password
+        async with httpx.AsyncClient() as client:
+            response = await client.post(
+                f"{self.url}/api/session",
+                json={
+                    "username": self.username,
+                    "password": self.password
+                },
+                headers={"Content-Type": "application/json"},
+                timeout=30.0
+            )
+
+            if response.status_code >= 400:
+                error_text = response.text[:500]
+                raise Exception(f"Metabase authentication failed: {response.status_code} - {error_text}")
+
+            data = response.json()
+            self._session_token = data.get("id")
+
+            if not self._session_token:
+                raise Exception("Metabase authentication failed: No session token returned")
+
+            # Metabase sessions typically last 14 days, but refresh after 12 hours
+            self._token_expiry = datetime.now() + timedelta(hours=12)
+            return self._session_token
+
+    def _get_auth_header(self) -> dict:
+        """Get the appropriate auth header based on authentication method."""
+        if self.api_key:
+            return {"x-api-key": self.api_key}
+        return {}
+
+    async def api_request(self, method: str, endpoint: str, params: dict = None, json_data: dict = None) -> Any:
+        """Make authenticated request to Metabase API."""
+        token = await self.get_session_token()
+        url = f"{self.url}/api/{endpoint.lstrip('/')}"
+
+        headers = {
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+
+        # Use appropriate auth method
+        if self.api_key:
+            headers["x-api-key"] = token
+        else:
+            headers["X-Metabase-Session"] = token
+
+        async with httpx.AsyncClient() as client:
+            response = await client.request(
+                method=method,
+                url=url,
+                params=params,
+                json=json_data,
+                headers=headers,
+                timeout=60.0
+            )
+
+            if response.status_code == 401:
+                # Token expired, clear cache and retry
+                self._session_token = None
+                self._token_expiry = None
+                token = await self.get_session_token()
+                if self.api_key:
+                    headers["x-api-key"] = token
+                else:
+                    headers["X-Metabase-Session"] = token
+
+                response = await client.request(
+                    method=method,
+                    url=url,
+                    params=params,
+                    json=json_data,
+                    headers=headers,
+                    timeout=60.0
+                )
+
+            if response.status_code >= 400:
+                error_text = response.text[:500]
+                logger.error(f"Metabase API error: {response.status_code} - {error_text}")
+                raise Exception(f"Metabase API error: {response.status_code} - {error_text}")
+
+            if not response.text.strip():
+                return {}
+
+            return response.json()
+
+    async def verify_credentials(self) -> bool:
+        """Verify credentials are valid."""
+        try:
+            await self.api_request("GET", "user/current")
+            return True
+        except Exception as e:
+            logger.error(f"Metabase credential verification failed: {e}")
+            return False
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def metabase_list_databases() -> str:
+    """List all databases connected to Metabase.
+
+    Returns database IDs, names, and connection details.
+    Use database IDs with other Metabase tools to query specific databases.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        result = await metabase_config.api_request("GET", "database")
+
+        databases = result if isinstance(result, list) else result.get("data", result.get("databases", []))
+
+        if not databases:
+            return "No databases found in Metabase."
+
+        lines = [f"# Metabase Databases ({len(databases)} found)\n"]
+
+        for db in databases:
+            db_id = db.get("id", "N/A")
+            name = db.get("name", "Unknown")
+            engine = db.get("engine", "Unknown")
+            is_sample = db.get("is_sample", False)
+
+            details = db.get("details", {})
+            host = details.get("host", details.get("db", "N/A"))
+
+            sample_tag = " (Sample)" if is_sample else ""
+            lines.append(f"### {name}{sample_tag}")
+            lines.append(f"**ID:** `{db_id}` | **Engine:** {engine}")
+            if host and host != "N/A":
+                lines.append(f"**Host:** {host}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Metabase list databases error: {e}")
+        return f"Error listing databases: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def metabase_list_tables(
+    database_id: int = Field(..., description="Database ID to list tables from")
+) -> str:
+    """List all tables in a Metabase database.
+
+    Returns table names and their metadata.
+    Use this to explore database schema before running queries.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        result = await metabase_config.api_request("GET", f"database/{database_id}/metadata")
+
+        db_name = result.get("name", f"Database {database_id}")
+        tables = result.get("tables", [])
+
+        if not tables:
+            return f"No tables found in database '{db_name}'."
+
+        lines = [f"# Tables in {db_name} ({len(tables)} found)\n"]
+
+        for table in tables:
+            table_id = table.get("id", "N/A")
+            name = table.get("name", "Unknown")
+            display_name = table.get("display_name", name)
+            schema = table.get("schema", "")
+            row_count = table.get("rows", "N/A")
+
+            schema_prefix = f"{schema}." if schema else ""
+            lines.append(f"### {schema_prefix}{display_name}")
+            lines.append(f"**ID:** `{table_id}` | **Name:** `{name}`")
+            if row_count != "N/A":
+                lines.append(f"**Rows:** ~{row_count:,}" if isinstance(row_count, int) else f"**Rows:** {row_count}")
+
+            # List fields/columns
+            fields = table.get("fields", [])
+            if fields:
+                field_names = [f.get("name", "?") for f in fields[:10]]
+                lines.append(f"**Columns:** {', '.join(field_names)}" + ("..." if len(fields) > 10 else ""))
+            lines.append("")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Metabase list tables error: {e}")
+        return f"Error listing tables: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def metabase_search_dashboards(
+    query: Optional[str] = Field(None, description="Search query for dashboard names"),
+    limit: int = Field(20, description="Maximum number of results (1-100)")
+) -> str:
+    """Search for dashboards in Metabase.
+
+    Returns dashboard names, IDs, and descriptions.
+    Use dashboard IDs with metabase_get_dashboard for detailed information.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        limit = min(max(1, limit), 100)
+
+        if query:
+            # Use search API
+            params = {"q": query, "models": "dashboard", "limit": limit}
+            result = await metabase_config.api_request("GET", "search", params=params)
+            dashboards = result.get("data", []) if isinstance(result, dict) else result
+        else:
+            # List all dashboards
+            result = await metabase_config.api_request("GET", "dashboard")
+            dashboards = result if isinstance(result, list) else result.get("data", [])
+            dashboards = dashboards[:limit]
+
+        if not dashboards:
+            return "No dashboards found." + (f" matching '{query}'" if query else "")
+
+        lines = [f"# Metabase Dashboards ({len(dashboards)} found)\n"]
+
+        for dash in dashboards:
+            dash_id = dash.get("id", "N/A")
+            name = dash.get("name", "Untitled Dashboard")
+            description = dash.get("description", "")
+            collection = dash.get("collection", {})
+            collection_name = collection.get("name", "Root") if collection else "Root"
+            creator = dash.get("creator", {})
+            creator_name = creator.get("common_name", creator.get("email", "Unknown")) if creator else "Unknown"
+
+            lines.append(f"### {name}")
+            lines.append(f"**ID:** `{dash_id}` | **Collection:** {collection_name}")
+            if description:
+                lines.append(f"**Description:** {description[:200]}")
+            lines.append(f"**Created by:** {creator_name}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Metabase search dashboards error: {e}")
+        return f"Error searching dashboards: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def metabase_get_dashboard(
+    dashboard_id: int = Field(..., description="Dashboard ID to retrieve")
+) -> str:
+    """Get detailed information about a Metabase dashboard.
+
+    Returns dashboard metadata, cards (questions), and their configurations.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        result = await metabase_config.api_request("GET", f"dashboard/{dashboard_id}")
+
+        name = result.get("name", "Untitled Dashboard")
+        description = result.get("description", "No description")
+        collection = result.get("collection", {})
+        collection_name = collection.get("name", "Root") if collection else "Root"
+        creator = result.get("creator", {})
+        creator_name = creator.get("common_name", creator.get("email", "Unknown")) if creator else "Unknown"
+        created_at = result.get("created_at", "Unknown")
+        updated_at = result.get("updated_at", "Unknown")
+
+        cards = result.get("dashcards", result.get("ordered_cards", []))
+
+        lines = [
+            f"# {name}",
+            f"",
+            f"**ID:** `{dashboard_id}`",
+            f"**Collection:** {collection_name}",
+            f"**Description:** {description}",
+            f"**Created by:** {creator_name}",
+            f"**Created:** {created_at[:10] if created_at else 'Unknown'}",
+            f"**Updated:** {updated_at[:10] if updated_at else 'Unknown'}",
+            f"",
+            f"## Cards/Questions ({len(cards)})",
+            ""
+        ]
+
+        for i, dashcard in enumerate(cards, 1):
+            card = dashcard.get("card", {})
+            if not card:
+                continue
+
+            card_id = card.get("id", "N/A")
+            card_name = card.get("name", "Untitled")
+            card_type = card.get("display", "Unknown")
+            query_type = card.get("query_type", "Unknown")
+
+            lines.append(f"### {i}. {card_name}")
+            lines.append(f"**Card ID:** `{card_id}` | **Type:** {card_type} | **Query:** {query_type}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Metabase get dashboard error: {e}")
+        return f"Error getting dashboard: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def metabase_list_questions(
+    collection_id: Optional[int] = Field(None, description="Filter by collection ID"),
+    limit: int = Field(50, description="Maximum number of results (1-100)")
+) -> str:
+    """List saved questions (cards) in Metabase.
+
+    Returns question names, IDs, and query types.
+    Use question IDs with metabase_run_question to execute them.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        limit = min(max(1, limit), 100)
+
+        # Get cards (questions)
+        params = {"model": "card"}
+        if collection_id:
+            params["collection"] = collection_id
+
+        result = await metabase_config.api_request("GET", "card")
+        questions = result if isinstance(result, list) else result.get("data", [])
+        questions = questions[:limit]
+
+        if not questions:
+            return "No saved questions found."
+
+        lines = [f"# Metabase Saved Questions ({len(questions)} found)\n"]
+
+        for q in questions:
+            q_id = q.get("id", "N/A")
+            name = q.get("name", "Untitled Question")
+            display = q.get("display", "Unknown")
+            query_type = q.get("query_type", "Unknown")
+            database_id = q.get("database_id", "N/A")
+            collection = q.get("collection", {})
+            collection_name = collection.get("name", "Root") if collection else "Root"
+
+            lines.append(f"### {name}")
+            lines.append(f"**ID:** `{q_id}` | **Display:** {display} | **Query Type:** {query_type}")
+            lines.append(f"**Database ID:** `{database_id}` | **Collection:** {collection_name}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Metabase list questions error: {e}")
+        return f"Error listing questions: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def metabase_run_question(
+    question_id: int = Field(..., description="Question/Card ID to execute"),
+    parameters: Optional[str] = Field(None, description="JSON string of parameters for the question (if it has filters)")
+) -> str:
+    """Execute a saved question (card) in Metabase and return results.
+
+    Returns the query results in a formatted table.
+    For questions with filters, provide parameters as JSON.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        # Parse parameters if provided
+        params_dict = {}
+        if parameters:
+            try:
+                params_dict = json.loads(parameters)
+            except json.JSONDecodeError:
+                return f"Error: Invalid JSON in parameters: {parameters}"
+
+        # Execute the question
+        result = await metabase_config.api_request(
+            "POST",
+            f"card/{question_id}/query",
+            json_data={"parameters": params_dict} if params_dict else None
+        )
+
+        # Get question metadata
+        card = await metabase_config.api_request("GET", f"card/{question_id}")
+        question_name = card.get("name", f"Question {question_id}")
+
+        # Extract data
+        data = result.get("data", {})
+        rows = data.get("rows", [])
+        cols = data.get("cols", [])
+        col_names = [c.get("display_name", c.get("name", f"Col{i}")) for i, c in enumerate(cols)]
+
+        if not rows:
+            return f"# {question_name}\n\nNo results returned."
+
+        lines = [
+            f"# {question_name}",
+            f"",
+            f"**Results:** {len(rows)} rows | **Columns:** {len(cols)}",
+            ""
+        ]
+
+        # Create markdown table (limit to first 100 rows for display)
+        display_rows = rows[:100]
+
+        # Header
+        lines.append("| " + " | ".join(col_names) + " |")
+        lines.append("| " + " | ".join(["---"] * len(col_names)) + " |")
+
+        # Rows
+        for row in display_rows:
+            formatted_row = []
+            for val in row:
+                if val is None:
+                    formatted_row.append("_null_")
+                elif isinstance(val, (int, float)):
+                    formatted_row.append(str(val))
+                else:
+                    # Truncate long strings and escape pipes
+                    str_val = str(val)[:50].replace("|", "\\|")
+                    formatted_row.append(str_val)
+            lines.append("| " + " | ".join(formatted_row) + " |")
+
+        if len(rows) > 100:
+            lines.append(f"\n_...showing first 100 of {len(rows)} rows_")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Metabase run question error: {e}")
+        return f"Error running question: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def metabase_run_query(
+    database_id: int = Field(..., description="Database ID to query"),
+    query: str = Field(..., description="Native SQL query to execute"),
+    limit: int = Field(100, description="Maximum rows to return (1-1000)")
+) -> str:
+    """Execute a native SQL query against a Metabase database.
+
+    Returns query results in a formatted table.
+    Use metabase_list_databases to find database IDs.
+    Use metabase_list_tables to explore available tables.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        limit = min(max(1, limit), 1000)
+
+        # Build native query payload
+        payload = {
+            "database": database_id,
+            "type": "native",
+            "native": {
+                "query": query
+            },
+            "constraints": {
+                "max-results": limit
+            }
+        }
+
+        result = await metabase_config.api_request("POST", "dataset", json_data=payload)
+
+        # Check for errors
+        if result.get("status") == "failed":
+            error = result.get("error", "Unknown error")
+            return f"Query failed: {error}"
+
+        # Extract data
+        data = result.get("data", {})
+        rows = data.get("rows", [])
+        cols = data.get("cols", [])
+        col_names = [c.get("display_name", c.get("name", f"Col{i}")) for i, c in enumerate(cols)]
+
+        if not rows:
+            return f"Query executed successfully but returned no results."
+
+        row_count = result.get("row_count", len(rows))
+
+        lines = [
+            f"# Query Results",
+            f"",
+            f"**Results:** {row_count} rows | **Columns:** {len(cols)}",
+            ""
+        ]
+
+        # Create markdown table (limit display)
+        display_rows = rows[:100]
+
+        # Header
+        lines.append("| " + " | ".join(col_names) + " |")
+        lines.append("| " + " | ".join(["---"] * len(col_names)) + " |")
+
+        # Rows
+        for row in display_rows:
+            formatted_row = []
+            for val in row:
+                if val is None:
+                    formatted_row.append("_null_")
+                elif isinstance(val, (int, float)):
+                    formatted_row.append(str(val))
+                else:
+                    str_val = str(val)[:50].replace("|", "\\|")
+                    formatted_row.append(str_val)
+            lines.append("| " + " | ".join(formatted_row) + " |")
+
+        if len(rows) > 100:
+            lines.append(f"\n_...showing first 100 of {row_count} rows_")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Metabase run query error: {e}")
+        return f"Error running query: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def metabase_get_collections() -> str:
+    """List all collections in Metabase.
+
+    Collections organize dashboards and questions into folders.
+    Returns collection names, IDs, and hierarchy.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        result = await metabase_config.api_request("GET", "collection")
+
+        collections = result if isinstance(result, list) else result.get("data", [])
+
+        if not collections:
+            return "No collections found."
+
+        lines = [f"# Metabase Collections ({len(collections)} found)\n"]
+
+        for coll in collections:
+            coll_id = coll.get("id", "N/A")
+            name = coll.get("name", "Untitled")
+            description = coll.get("description", "")
+            parent_id = coll.get("parent_id")
+            personal_owner_id = coll.get("personal_owner_id")
+
+            type_tag = ""
+            if personal_owner_id:
+                type_tag = " (Personal)"
+            elif coll_id == "root":
+                type_tag = " (Root)"
+
+            lines.append(f"### {name}{type_tag}")
+            lines.append(f"**ID:** `{coll_id}`")
+            if parent_id:
+                lines.append(f"**Parent:** `{parent_id}`")
+            if description:
+                lines.append(f"**Description:** {description[:100]}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Metabase get collections error: {e}")
+        return f"Error getting collections: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def metabase_get_user_info() -> str:
+    """Get information about the current Metabase user and instance.
+
+    Returns user details and basic Metabase instance information.
+    Useful for verifying connection and permissions.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        user = await metabase_config.api_request("GET", "user/current")
+
+        email = user.get("email", "Unknown")
+        name = user.get("common_name", user.get("first_name", "Unknown"))
+        is_superuser = user.get("is_superuser", False)
+        is_active = user.get("is_active", True)
+        groups = user.get("group_ids", [])
+        last_login = user.get("last_login", "Unknown")
+
+        lines = [
+            f"# Metabase Connection Info",
+            f"",
+            f"## Instance",
+            f"**URL:** {metabase_config.url}",
+            f"**Auth Method:** {'API Key' if metabase_config.api_key else 'Session Token'}",
+            f"",
+            f"## Current User",
+            f"**Name:** {name}",
+            f"**Email:** {email}",
+            f"**Superuser:** {'Yes' if is_superuser else 'No'}",
+            f"**Active:** {'Yes' if is_active else 'No'}",
+            f"**Groups:** {len(groups)} group(s)",
+            f"**Last Login:** {last_login[:10] if last_login and last_login != 'Unknown' else last_login}",
+        ]
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Metabase get user info error: {e}")
+        return f"Error getting user info: {str(e)}"
+
+
+# ============================================================================
 # Server Status
 # ============================================================================
 
@@ -16528,6 +17233,14 @@ from starlette.middleware.cors import CORSMiddleware
             "check_type": "api_key",
             "env_vars": ["AUVIK_REGION"],
             "auth_env_vars": ["AUVIK_USERNAME", "AUVIK_API_KEY"]
+        },
+        {
+            "name": "Metabase",
+            "config": metabase_config,
+            "category": "Business Intelligence",
+            "check_type": "oauth",
+            "env_vars": ["METABASE_URL"],
+            "auth_env_vars": ["METABASE_USERNAME", "METABASE_PASSWORD", "METABASE_API_KEY"]
         },
     ]
 
