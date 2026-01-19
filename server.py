@@ -16428,6 +16428,24 @@ async def server_status() -> str:
             missing.append("CLIENT_SECRET")
         lines.append(f"⚠️ **NinjaOne:** Missing: {', '.join(missing)}")
 
+    # Metabase status
+    if metabase_config.is_configured:
+        try:
+            await metabase_config.get_session_token()
+            lines.append(f"✅ **Metabase:** Connected ({metabase_config.url})")
+        except Exception as e:
+            lines.append(f"❌ **Metabase:** Auth failed - {str(e)[:50]}")
+    else:
+        missing = []
+        if not os.getenv("METABASE_URL") and not get_secret_sync("METABASE_URL"):
+            missing.append("URL")
+        if not os.getenv("METABASE_API_KEY") and not get_secret_sync("METABASE_API_KEY"):
+            if not os.getenv("METABASE_USERNAME") and not get_secret_sync("METABASE_USERNAME"):
+                missing.append("USERNAME")
+            if not os.getenv("METABASE_PASSWORD") and not get_secret_sync("METABASE_PASSWORD"):
+                missing.append("PASSWORD")
+        lines.append(f"⚠️ **Metabase:** Missing: {', '.join(missing) if missing else 'credentials'}")
+
     lines.append(f"\n**Cloud Run URL:** {CLOUD_RUN_URL}")
     return "\n".join(lines)
 
