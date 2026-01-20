@@ -25,6 +25,7 @@ import asyncio
 import logging
 import json
 import re
+import uuid
 from datetime import datetime, timedelta, date, timezone
 from typing import Optional, Dict, Any
 
@@ -15748,6 +15749,112 @@ async def metabase_list_tables(
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
+async def metabase_get_table_fields(
+    table_id: int = Field(..., description="Table ID to get fields from. Use metabase_list_tables to find table IDs.")
+) -> str:
+    """Get detailed field information for a table in Metabase.
+
+    Returns field IDs, names, types, and semantic types - essential for setting up
+    template_tags (filter variables) in questions.
+
+    Use the field IDs in template_tags like:
+    {
+      "my_filter": {
+        "type": "dimension",
+        "dimension": ["field", <field_id>, null],
+        "widget-type": "category"
+      }
+    }
+
+    Common widget types by field type:
+    - Text fields: "category", "text"
+    - Number fields: "number", "category"
+    - Date fields: "date/all-options", "date/single", "date/range", "date/relative"
+    - ID fields: "id", "category"
+    - Location fields: "location/city", "location/state", "location/country"
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        result = await metabase_config.api_request("GET", f"table/{table_id}/query_metadata")
+
+        table_name = result.get("name", f"Table {table_id}")
+        display_name = result.get("display_name", table_name)
+        schema = result.get("schema", "")
+        fields = result.get("fields", [])
+
+        if not fields:
+            return f"No fields found in table '{display_name}'."
+
+        schema_prefix = f"{schema}." if schema else ""
+        lines = [
+            f"# Fields in {schema_prefix}{display_name}",
+            f"**Table ID:** `{table_id}`",
+            f"**Field Count:** {len(fields)}",
+            f"",
+            f"## Field Reference for Template Tags",
+            f"Use field IDs to create filter variables in questions.",
+            f"",
+        ]
+
+        # Group fields by semantic type for easier navigation
+        for field in fields:
+            field_id = field.get("id", "N/A")
+            name = field.get("name", "unknown")
+            display = field.get("display_name", name)
+            base_type = field.get("base_type", "unknown")
+            semantic_type = field.get("semantic_type") or "No semantic type"
+            description = field.get("description", "")
+
+            # Suggest appropriate widget types based on field type
+            widget_suggestions = []
+            if "date" in base_type.lower() or "time" in base_type.lower():
+                widget_suggestions = ["date/all-options", "date/range", "date/relative"]
+            elif "int" in base_type.lower() or "float" in base_type.lower() or "decimal" in base_type.lower():
+                widget_suggestions = ["number", "category"]
+            elif "bool" in base_type.lower():
+                widget_suggestions = ["category"]
+            else:
+                widget_suggestions = ["category", "text"]
+
+            if "pk" in semantic_type.lower() or "fk" in semantic_type.lower() or "id" in semantic_type.lower():
+                widget_suggestions = ["id", "category"]
+
+            lines.append(f"### `{name}` (ID: {field_id})")
+            lines.append(f"- **Display Name:** {display}")
+            lines.append(f"- **Base Type:** `{base_type}`")
+            lines.append(f"- **Semantic Type:** {semantic_type}")
+            if description:
+                lines.append(f"- **Description:** {description}")
+            lines.append(f"- **Suggested Widgets:** {', '.join(widget_suggestions)}")
+            lines.append(f"- **Template Tag Dimension:** `[\"field\", {field_id}, null]`")
+            lines.append(f"")
+
+        # Add example template_tags JSON
+        if fields:
+            example_field = fields[0]
+            example_id = example_field.get("id", 12345)
+            example_name = example_field.get("name", "field_name")
+            lines.append(f"## Example Template Tag")
+            lines.append(f"```json")
+            lines.append(f'{{')
+            lines.append(f'  "{example_name}_filter": {{')
+            lines.append(f'    "type": "dimension",')
+            lines.append(f'    "dimension": ["field", {example_id}, null],')
+            lines.append(f'    "widget-type": "category"')
+            lines.append(f'  }}')
+            lines.append(f'}}')
+            lines.append(f"```")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Metabase get table fields error: {e}")
+        return f"Error getting table fields: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
 async def metabase_search_dashboards(
     query: Optional[str] = Field(None, description="Search query for dashboard names"),
     limit: int = Field(20, description="Maximum number of results (1-100)")
@@ -15911,6 +16018,115 @@ async def metabase_list_questions(
     except Exception as e:
         logger.error(f"Metabase list questions error: {e}")
         return f"Error listing questions: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def metabase_get_question(
+    question_id: int = Field(..., description="Question/Card ID to retrieve")
+) -> str:
+    """Get detailed information about a saved question (card) in Metabase.
+
+    Returns comprehensive question details including:
+    - Basic info (name, description, display type)
+    - SQL query content
+    - Template tags (filter variables) with field IDs and widget types
+    - Visualization settings
+    - Collection and database info
+
+    Use this to inspect existing questions before updating them,
+    especially to understand template_tags configuration.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        card = await metabase_config.api_request("GET", f"card/{question_id}")
+
+        name = card.get("name", "Untitled")
+        description = card.get("description", "No description")
+        display = card.get("display", "table")
+        archived = card.get("archived", False)
+        collection = card.get("collection", {})
+        collection_name = collection.get("name", "Root") if collection else "Root"
+        collection_id = collection.get("id") if collection else None
+
+        dataset_query = card.get("dataset_query", {})
+        database_id = dataset_query.get("database")
+        query_type = dataset_query.get("type", "unknown")
+        native = dataset_query.get("native", {})
+        query = native.get("query", "")
+        template_tags = native.get("template-tags", {})
+
+        viz_settings = card.get("visualization_settings", {})
+
+        lines = [
+            f"# Question: {name}",
+            f"",
+            f"## Basic Info",
+            f"**ID:** `{question_id}`",
+            f"**Description:** {description}",
+            f"**Display Type:** {display}",
+            f"**Archived:** {'Yes' if archived else 'No'}",
+            f"**Collection:** {collection_name} (ID: {collection_id})",
+            f"**Database ID:** {database_id}",
+            f"**Query Type:** {query_type}",
+            f"",
+            f"## SQL Query",
+            f"```sql",
+            f"{query}",
+            f"```",
+            f"",
+        ]
+
+        # Template tags section
+        if template_tags:
+            lines.append(f"## Filter Variables (Template Tags)")
+            lines.append(f"")
+            for tag_name, tag_config in template_tags.items():
+                tag_type = tag_config.get("type", "text")
+                widget_type = tag_config.get("widget-type", "N/A")
+                dimension = tag_config.get("dimension", [])
+                display_name = tag_config.get("display-name", tag_name)
+                default = tag_config.get("default")
+                required = tag_config.get("required", False)
+
+                lines.append(f"### `{tag_name}`")
+                lines.append(f"- **Display Name:** {display_name}")
+                lines.append(f"- **Type:** {tag_type}")
+                lines.append(f"- **Widget Type:** {widget_type}")
+                if dimension:
+                    lines.append(f"- **Dimension:** `{json.dumps(dimension)}`")
+                if default is not None:
+                    lines.append(f"- **Default:** {default}")
+                lines.append(f"- **Required:** {'Yes' if required else 'No'}")
+                lines.append(f"")
+
+            # Add JSON representation for easy copying
+            lines.append(f"### Template Tags JSON (for metabase_update_question)")
+            lines.append(f"```json")
+            lines.append(json.dumps(template_tags, indent=2))
+            lines.append(f"```")
+            lines.append(f"")
+        else:
+            lines.append(f"## Filter Variables (Template Tags)")
+            lines.append(f"No filter variables defined.")
+            lines.append(f"")
+
+        # Visualization settings section
+        if viz_settings:
+            lines.append(f"## Visualization Settings")
+            lines.append(f"```json")
+            lines.append(json.dumps(viz_settings, indent=2))
+            lines.append(f"```")
+        else:
+            lines.append(f"## Visualization Settings")
+            lines.append(f"No custom visualization settings.")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Metabase get question error: {e}")
+        return f"Error getting question: {str(e)}"
 
 
 @mcp.tool(annotations={"readOnlyHint": True})
@@ -16177,33 +16393,87 @@ async def metabase_get_user_info() -> str:
 async def metabase_create_question(
     name: str = Field(..., description="Name for the new question"),
     database_id: int = Field(..., description="Database ID to query against"),
-    query: str = Field(..., description="Native SQL query for the question"),
+    query: str = Field(..., description="Native SQL query for the question. Use {{variable_name}} syntax for filter variables, and [[ AND {{variable_name}} ]] to make filters optional."),
     display: str = Field("table", description="Visualization type: table, bar, line, pie, scalar, row, area, combo, pivot, funnel, scatter, map, waterfall, trend, progress, gauge, number"),
     collection_id: Optional[int] = Field(None, description="Collection ID to save the question in (null for root)"),
-    description: Optional[str] = Field(None, description="Description for the question")
+    description: Optional[str] = Field(None, description="Description for the question"),
+    template_tags: Optional[str] = Field(None, description="JSON string defining filter variables for the query. Example: {\"brand\": {\"type\": \"dimension\", \"dimension\": [\"field\", 12345, null], \"widget-type\": \"category\"}, \"date_filter\": {\"type\": \"dimension\", \"dimension\": [\"field\", 12346, null], \"widget-type\": \"date/all-options\"}}. Use metabase_get_table_fields to find field IDs."),
+    visualization_settings: Optional[str] = Field(None, description="JSON string for visualization settings. Examples: {\"graph.dimensions\": [\"category\"], \"graph.metrics\": [\"count\"]} for charts, {\"table.pivot_column\": \"status\", \"table.cell_column\": \"count\"} for pivot tables.")
 ) -> str:
-    """Create a new saved question (card) in Metabase.
+    """Create a new saved question (card) in Metabase with optional filter variables.
 
     Creates a native SQL question with the specified visualization type.
     Use metabase_list_databases to find valid database IDs.
     Use metabase_get_collections to find valid collection IDs.
+    Use metabase_get_table_fields to find field IDs for template_tags.
+
+    Filter variables (template_tags) allow you to add interactive filters to questions:
+    - Use {{variable_name}} in your SQL query for required filters
+    - Use [[ AND {{variable_name}} ]] to make filters OPTIONAL (query runs even without a value)
+    - Define the variable in template_tags with type, dimension, and widget-type
+
+    Example SQL with optional filters:
+        SELECT * FROM orders WHERE 1=1 [[ AND {{brand}} ]] [[ AND {{order_date}} ]]
+
+    Widget types: text, number, date/single, date/range, date/relative, date/month-year,
+    date/quarter-year, date/all-options, category, id, location/city, location/state,
+    location/zip_code, location/country
     """
     if not metabase_config.is_configured:
         return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
 
     try:
+        # Build native query object
+        native_query = {"query": query}
+
+        # Parse and add template_tags if provided
+        if template_tags:
+            try:
+                tags = json.loads(template_tags)
+                # Validate and enhance template tags structure
+                processed_tags = {}
+                for tag_name, tag_config in tags.items():
+                    processed_tag = {
+                        "id": tag_config.get("id", str(uuid.uuid4())),  # Auto-generate UUID if not provided
+                        "name": tag_name,
+                        "display-name": tag_config.get("display-name", tag_name.replace("_", " ").title()),
+                        "type": tag_config.get("type", "text"),
+                    }
+                    # Add dimension for dimension-type filters
+                    if tag_config.get("dimension"):
+                        processed_tag["dimension"] = tag_config["dimension"]
+                    # Add widget-type if specified
+                    if tag_config.get("widget-type"):
+                        processed_tag["widget-type"] = tag_config["widget-type"]
+                    # Add default value if specified
+                    if tag_config.get("default"):
+                        processed_tag["default"] = tag_config["default"]
+                    # Add required flag if specified
+                    if tag_config.get("required") is not None:
+                        processed_tag["required"] = tag_config["required"]
+                    processed_tags[tag_name] = processed_tag
+                native_query["template-tags"] = processed_tags
+            except json.JSONDecodeError as e:
+                return f"Error: Invalid JSON in template_tags: {str(e)}"
+
         payload = {
             "name": name,
             "dataset_query": {
                 "database": database_id,
                 "type": "native",
-                "native": {
-                    "query": query
-                }
+                "native": native_query
             },
             "display": display,
             "visualization_settings": {}
         }
+
+        # Parse and add visualization_settings if provided
+        if visualization_settings:
+            try:
+                viz_settings = json.loads(visualization_settings)
+                payload["visualization_settings"] = viz_settings
+            except json.JSONDecodeError as e:
+                return f"Error: Invalid JSON in visualization_settings: {str(e)}"
 
         if collection_id is not None:
             payload["collection_id"] = collection_id
@@ -16214,8 +16484,15 @@ async def metabase_create_question(
 
         card_id = result.get("id")
         card_name = result.get("name", name)
+        has_filters = "template-tags" in native_query
 
-        return f"✅ Question created successfully!\n\n**ID:** `{card_id}`\n**Name:** {card_name}\n**Display:** {display}\n**Database ID:** {database_id}\n\nUse `metabase_run_question(question_id={card_id})` to execute this question."
+        response = f"✅ Question created successfully!\n\n**ID:** `{card_id}`\n**Name:** {card_name}\n**Display:** {display}\n**Database ID:** {database_id}"
+        if has_filters:
+            filter_names = list(native_query["template-tags"].keys())
+            response += f"\n**Filters:** {', '.join(filter_names)}"
+        response += f"\n\nUse `metabase_run_question(question_id={card_id})` to execute this question."
+
+        return response
 
     except Exception as e:
         logger.error(f"Metabase create question error: {e}")
@@ -16226,14 +16503,30 @@ async def metabase_create_question(
 async def metabase_update_question(
     question_id: int = Field(..., description="Question/Card ID to update"),
     name: Optional[str] = Field(None, description="New name for the question"),
-    query: Optional[str] = Field(None, description="New SQL query"),
-    display: Optional[str] = Field(None, description="New visualization type"),
+    query: Optional[str] = Field(None, description="New SQL query. Use {{variable_name}} syntax for filter variables, and [[ AND {{variable_name}} ]] to make filters optional."),
+    display: Optional[str] = Field(None, description="New visualization type: table, bar, line, pie, scalar, row, area, combo, pivot, funnel, scatter, map, waterfall, trend, progress, gauge, number"),
     description: Optional[str] = Field(None, description="New description"),
-    collection_id: Optional[int] = Field(None, description="Move to this collection ID")
+    collection_id: Optional[int] = Field(None, description="Move to this collection ID"),
+    template_tags: Optional[str] = Field(None, description="JSON string defining filter variables. Example: {\"brand\": {\"type\": \"dimension\", \"dimension\": [\"field\", 12345, null], \"widget-type\": \"category\"}}. Set to '{}' to clear all filters. Use metabase_get_table_fields to find field IDs."),
+    visualization_settings: Optional[str] = Field(None, description="JSON string for visualization settings. Examples: {\"graph.dimensions\": [\"category\"], \"graph.metrics\": [\"count\"]} for charts.")
 ) -> str:
-    """Update an existing saved question (card) in Metabase.
+    """Update an existing saved question (card) in Metabase with optional filter variables.
 
     Only provided fields will be updated. Other fields remain unchanged.
+    Use metabase_get_question to view current question configuration including template_tags.
+    Use metabase_get_table_fields to find field IDs for template_tags.
+
+    Filter variables (template_tags) allow you to add interactive filters:
+    - Use {{variable_name}} in your SQL query for required filters
+    - Use [[ AND {{variable_name}} ]] to make filters OPTIONAL (query runs even without a value)
+    - Define the variable in template_tags with type, dimension, and widget-type
+
+    Example SQL with optional filters:
+        SELECT * FROM orders WHERE 1=1 [[ AND {{brand}} ]] [[ AND {{order_date}} ]]
+
+    Widget types: text, number, date/single, date/range, date/relative, date/month-year,
+    date/quarter-year, date/all-options, category, id, location/city, location/state,
+    location/zip_code, location/country
     """
     if not metabase_config.is_configured:
         return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
@@ -16253,16 +16546,70 @@ async def metabase_update_question(
         if collection_id is not None:
             payload["collection_id"] = collection_id
 
-        if query is not None:
-            # Update the query while preserving the database
+        # Handle visualization_settings update
+        if visualization_settings is not None:
+            try:
+                viz_settings = json.loads(visualization_settings)
+                payload["visualization_settings"] = viz_settings
+            except json.JSONDecodeError as e:
+                return f"Error: Invalid JSON in visualization_settings: {str(e)}"
+
+        # Handle query and/or template_tags update
+        if query is not None or template_tags is not None:
+            # Get current dataset_query to preserve database and existing settings
             dataset_query = current.get("dataset_query", {})
             database_id = dataset_query.get("database")
+            current_native = dataset_query.get("native", {})
+
+            # Build new native query object
+            native_query = {}
+
+            # Use new query or preserve existing
+            if query is not None:
+                native_query["query"] = query
+            else:
+                native_query["query"] = current_native.get("query", "")
+
+            # Handle template_tags
+            if template_tags is not None:
+                try:
+                    tags = json.loads(template_tags)
+                    if tags:  # Non-empty tags object
+                        # Validate and enhance template tags structure
+                        processed_tags = {}
+                        for tag_name, tag_config in tags.items():
+                            processed_tag = {
+                                "id": tag_config.get("id", str(uuid.uuid4())),  # Auto-generate UUID if not provided
+                                "name": tag_name,
+                                "display-name": tag_config.get("display-name", tag_name.replace("_", " ").title()),
+                                "type": tag_config.get("type", "text"),
+                            }
+                            # Add dimension for dimension-type filters
+                            if tag_config.get("dimension"):
+                                processed_tag["dimension"] = tag_config["dimension"]
+                            # Add widget-type if specified
+                            if tag_config.get("widget-type"):
+                                processed_tag["widget-type"] = tag_config["widget-type"]
+                            # Add default value if specified
+                            if tag_config.get("default"):
+                                processed_tag["default"] = tag_config["default"]
+                            # Add required flag if specified
+                            if tag_config.get("required") is not None:
+                                processed_tag["required"] = tag_config["required"]
+                            processed_tags[tag_name] = processed_tag
+                        native_query["template-tags"] = processed_tags
+                    # Empty tags {} means clear all filters (don't include template-tags key)
+                except json.JSONDecodeError as e:
+                    return f"Error: Invalid JSON in template_tags: {str(e)}"
+            elif query is None:
+                # Preserve existing template tags if only updating other fields
+                if current_native.get("template-tags"):
+                    native_query["template-tags"] = current_native["template-tags"]
+
             payload["dataset_query"] = {
                 "database": database_id,
                 "type": "native",
-                "native": {
-                    "query": query
-                }
+                "native": native_query
             }
 
         if not payload:
@@ -16271,7 +16618,19 @@ async def metabase_update_question(
         result = await metabase_config.api_request("PUT", f"card/{question_id}", json_data=payload)
 
         updated_name = result.get("name", current.get("name"))
-        return f"✅ Question updated successfully!\n\n**ID:** `{question_id}`\n**Name:** {updated_name}\n**Updated fields:** {', '.join(payload.keys())}"
+
+        # Build response with filter info
+        response = f"✅ Question updated successfully!\n\n**ID:** `{question_id}`\n**Name:** {updated_name}\n**Updated fields:** {', '.join(payload.keys())}"
+
+        # Show filter info if template_tags were updated
+        if template_tags is not None:
+            if "dataset_query" in payload and payload["dataset_query"]["native"].get("template-tags"):
+                filter_names = list(payload["dataset_query"]["native"]["template-tags"].keys())
+                response += f"\n**Filters:** {', '.join(filter_names)}"
+            else:
+                response += "\n**Filters:** cleared"
+
+        return response
 
     except Exception as e:
         logger.error(f"Metabase update question error: {e}")
