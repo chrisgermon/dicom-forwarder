@@ -16118,6 +16118,1259 @@ async def metabase_get_user_info() -> str:
 
 
 # ============================================================================
+# Metabase Edit/Create Tools - Questions, Dashboards, Collections
+# ============================================================================
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def metabase_create_question(
+    name: str = Field(..., description="Name for the new question"),
+    database_id: int = Field(..., description="Database ID to query against"),
+    query: str = Field(..., description="Native SQL query for the question"),
+    display: str = Field("table", description="Visualization type: table, bar, line, pie, scalar, row, area, combo, pivot, funnel, scatter, map, waterfall, trend, progress, gauge, number"),
+    collection_id: Optional[int] = Field(None, description="Collection ID to save the question in (null for root)"),
+    description: Optional[str] = Field(None, description="Description for the question")
+) -> str:
+    """Create a new saved question (card) in Metabase.
+
+    Creates a native SQL question with the specified visualization type.
+    Use metabase_list_databases to find valid database IDs.
+    Use metabase_get_collections to find valid collection IDs.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        payload = {
+            "name": name,
+            "dataset_query": {
+                "database": database_id,
+                "type": "native",
+                "native": {
+                    "query": query
+                }
+            },
+            "display": display,
+            "visualization_settings": {}
+        }
+
+        if collection_id is not None:
+            payload["collection_id"] = collection_id
+        if description:
+            payload["description"] = description
+
+        result = await metabase_config.api_request("POST", "card", json_data=payload)
+
+        card_id = result.get("id")
+        card_name = result.get("name", name)
+
+        return f"✅ Question created successfully!\n\n**ID:** `{card_id}`\n**Name:** {card_name}\n**Display:** {display}\n**Database ID:** {database_id}\n\nUse `metabase_run_question(question_id={card_id})` to execute this question."
+
+    except Exception as e:
+        logger.error(f"Metabase create question error: {e}")
+        return f"Error creating question: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def metabase_update_question(
+    question_id: int = Field(..., description="Question/Card ID to update"),
+    name: Optional[str] = Field(None, description="New name for the question"),
+    query: Optional[str] = Field(None, description="New SQL query"),
+    display: Optional[str] = Field(None, description="New visualization type"),
+    description: Optional[str] = Field(None, description="New description"),
+    collection_id: Optional[int] = Field(None, description="Move to this collection ID")
+) -> str:
+    """Update an existing saved question (card) in Metabase.
+
+    Only provided fields will be updated. Other fields remain unchanged.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        # Get current card data
+        current = await metabase_config.api_request("GET", f"card/{question_id}")
+
+        payload = {}
+
+        if name is not None:
+            payload["name"] = name
+        if description is not None:
+            payload["description"] = description
+        if display is not None:
+            payload["display"] = display
+        if collection_id is not None:
+            payload["collection_id"] = collection_id
+
+        if query is not None:
+            # Update the query while preserving the database
+            dataset_query = current.get("dataset_query", {})
+            database_id = dataset_query.get("database")
+            payload["dataset_query"] = {
+                "database": database_id,
+                "type": "native",
+                "native": {
+                    "query": query
+                }
+            }
+
+        if not payload:
+            return "No updates provided. Specify at least one field to update."
+
+        result = await metabase_config.api_request("PUT", f"card/{question_id}", json_data=payload)
+
+        updated_name = result.get("name", current.get("name"))
+        return f"✅ Question updated successfully!\n\n**ID:** `{question_id}`\n**Name:** {updated_name}\n**Updated fields:** {', '.join(payload.keys())}"
+
+    except Exception as e:
+        logger.error(f"Metabase update question error: {e}")
+        return f"Error updating question: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True})
+async def metabase_delete_question(
+    question_id: int = Field(..., description="Question/Card ID to delete")
+) -> str:
+    """Delete a saved question (card) from Metabase.
+
+    WARNING: This permanently deletes the question. This action cannot be undone.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        # Get question name before deletion for confirmation
+        card = await metabase_config.api_request("GET", f"card/{question_id}")
+        card_name = card.get("name", f"Question {question_id}")
+
+        await metabase_config.api_request("DELETE", f"card/{question_id}")
+
+        return f"✅ Question deleted successfully!\n\n**Deleted ID:** `{question_id}`\n**Name:** {card_name}"
+
+    except Exception as e:
+        logger.error(f"Metabase delete question error: {e}")
+        return f"Error deleting question: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def metabase_archive_question(
+    question_id: int = Field(..., description="Question/Card ID to archive")
+) -> str:
+    """Archive a saved question (card) in Metabase.
+
+    Archived questions are hidden but not permanently deleted.
+    They can be restored later using metabase_unarchive_question.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        card = await metabase_config.api_request("GET", f"card/{question_id}")
+        card_name = card.get("name", f"Question {question_id}")
+
+        await metabase_config.api_request("PUT", f"card/{question_id}", json_data={"archived": True})
+
+        return f"✅ Question archived successfully!\n\n**ID:** `{question_id}`\n**Name:** {card_name}\n\nUse `metabase_unarchive_question` to restore it."
+
+    except Exception as e:
+        logger.error(f"Metabase archive question error: {e}")
+        return f"Error archiving question: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def metabase_unarchive_question(
+    question_id: int = Field(..., description="Question/Card ID to unarchive")
+) -> str:
+    """Restore an archived question (card) in Metabase.
+
+    Unarchives a previously archived question, making it visible again.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        await metabase_config.api_request("PUT", f"card/{question_id}", json_data={"archived": False})
+
+        card = await metabase_config.api_request("GET", f"card/{question_id}")
+        card_name = card.get("name", f"Question {question_id}")
+
+        return f"✅ Question restored successfully!\n\n**ID:** `{question_id}`\n**Name:** {card_name}"
+
+    except Exception as e:
+        logger.error(f"Metabase unarchive question error: {e}")
+        return f"Error unarchiving question: {str(e)}"
+
+
+# ============================================================================
+# Metabase Dashboard Management Tools
+# ============================================================================
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def metabase_create_dashboard(
+    name: str = Field(..., description="Name for the new dashboard"),
+    collection_id: Optional[int] = Field(None, description="Collection ID to save the dashboard in (null for root)"),
+    description: Optional[str] = Field(None, description="Description for the dashboard")
+) -> str:
+    """Create a new dashboard in Metabase.
+
+    Creates an empty dashboard that can have cards added to it.
+    Use metabase_add_card_to_dashboard to add questions/cards.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        payload = {"name": name}
+
+        if collection_id is not None:
+            payload["collection_id"] = collection_id
+        if description:
+            payload["description"] = description
+
+        result = await metabase_config.api_request("POST", "dashboard", json_data=payload)
+
+        dash_id = result.get("id")
+        dash_name = result.get("name", name)
+
+        return f"✅ Dashboard created successfully!\n\n**ID:** `{dash_id}`\n**Name:** {dash_name}\n\nUse `metabase_add_card_to_dashboard(dashboard_id={dash_id}, card_id=<question_id>)` to add cards."
+
+    except Exception as e:
+        logger.error(f"Metabase create dashboard error: {e}")
+        return f"Error creating dashboard: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def metabase_update_dashboard(
+    dashboard_id: int = Field(..., description="Dashboard ID to update"),
+    name: Optional[str] = Field(None, description="New name for the dashboard"),
+    description: Optional[str] = Field(None, description="New description"),
+    collection_id: Optional[int] = Field(None, description="Move to this collection ID")
+) -> str:
+    """Update an existing dashboard in Metabase.
+
+    Only provided fields will be updated. Other fields remain unchanged.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        payload = {}
+
+        if name is not None:
+            payload["name"] = name
+        if description is not None:
+            payload["description"] = description
+        if collection_id is not None:
+            payload["collection_id"] = collection_id
+
+        if not payload:
+            return "No updates provided. Specify at least one field to update."
+
+        result = await metabase_config.api_request("PUT", f"dashboard/{dashboard_id}", json_data=payload)
+
+        updated_name = result.get("name", f"Dashboard {dashboard_id}")
+        return f"✅ Dashboard updated successfully!\n\n**ID:** `{dashboard_id}`\n**Name:** {updated_name}\n**Updated fields:** {', '.join(payload.keys())}"
+
+    except Exception as e:
+        logger.error(f"Metabase update dashboard error: {e}")
+        return f"Error updating dashboard: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True})
+async def metabase_delete_dashboard(
+    dashboard_id: int = Field(..., description="Dashboard ID to delete")
+) -> str:
+    """Delete a dashboard from Metabase.
+
+    WARNING: This permanently deletes the dashboard. This action cannot be undone.
+    The questions (cards) on the dashboard are NOT deleted, only the dashboard itself.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        # Get dashboard name before deletion
+        dashboard = await metabase_config.api_request("GET", f"dashboard/{dashboard_id}")
+        dash_name = dashboard.get("name", f"Dashboard {dashboard_id}")
+
+        await metabase_config.api_request("DELETE", f"dashboard/{dashboard_id}")
+
+        return f"✅ Dashboard deleted successfully!\n\n**Deleted ID:** `{dashboard_id}`\n**Name:** {dash_name}"
+
+    except Exception as e:
+        logger.error(f"Metabase delete dashboard error: {e}")
+        return f"Error deleting dashboard: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def metabase_add_card_to_dashboard(
+    dashboard_id: int = Field(..., description="Dashboard ID to add the card to"),
+    card_id: int = Field(..., description="Question/Card ID to add"),
+    row: int = Field(0, description="Row position on the dashboard grid (0-based)"),
+    col: int = Field(0, description="Column position on the dashboard grid (0-based, max 17)"),
+    size_x: int = Field(6, description="Width of the card (1-18, default 6)"),
+    size_y: int = Field(4, description="Height of the card (minimum 1, default 4)")
+) -> str:
+    """Add a saved question (card) to a dashboard.
+
+    Cards are positioned on a grid layout. The dashboard is 18 columns wide.
+    Use row/col to position and size_x/size_y to set dimensions.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        # Validate grid dimensions
+        col = max(0, min(col, 17))
+        size_x = max(1, min(size_x, 18))
+        size_y = max(1, size_y)
+
+        payload = {
+            "cardId": card_id,
+            "row": row,
+            "col": col,
+            "size_x": size_x,
+            "size_y": size_y
+        }
+
+        result = await metabase_config.api_request("POST", f"dashboard/{dashboard_id}/cards", json_data=payload)
+
+        dashcard_id = result.get("id")
+
+        # Get card name for confirmation
+        card = await metabase_config.api_request("GET", f"card/{card_id}")
+        card_name = card.get("name", f"Card {card_id}")
+
+        return f"✅ Card added to dashboard successfully!\n\n**Dashboard ID:** `{dashboard_id}`\n**Card ID:** `{card_id}` ({card_name})\n**Dashcard ID:** `{dashcard_id}`\n**Position:** row {row}, col {col}\n**Size:** {size_x}x{size_y}"
+
+    except Exception as e:
+        logger.error(f"Metabase add card to dashboard error: {e}")
+        return f"Error adding card to dashboard: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def metabase_remove_card_from_dashboard(
+    dashboard_id: int = Field(..., description="Dashboard ID to remove the card from"),
+    dashcard_id: int = Field(..., description="Dashcard ID to remove (from metabase_get_dashboard response)")
+) -> str:
+    """Remove a card from a dashboard.
+
+    Note: This removes the card from the dashboard but does NOT delete the underlying question.
+    The dashcard_id is the ID shown in metabase_get_dashboard, not the question/card ID.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        await metabase_config.api_request("DELETE", f"dashboard/{dashboard_id}/cards", json_data={"dashcardId": dashcard_id})
+
+        return f"✅ Card removed from dashboard successfully!\n\n**Dashboard ID:** `{dashboard_id}`\n**Removed Dashcard ID:** `{dashcard_id}`"
+
+    except Exception as e:
+        logger.error(f"Metabase remove card from dashboard error: {e}")
+        return f"Error removing card from dashboard: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def metabase_copy_dashboard(
+    dashboard_id: int = Field(..., description="Dashboard ID to copy"),
+    name: Optional[str] = Field(None, description="Name for the copy (defaults to 'Copy of <original name>')"),
+    collection_id: Optional[int] = Field(None, description="Collection ID for the copy (defaults to same collection)")
+) -> str:
+    """Create a copy of an existing dashboard.
+
+    Copies the dashboard structure and all card references.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        payload = {}
+        if name:
+            payload["name"] = name
+        if collection_id is not None:
+            payload["collection_id"] = collection_id
+
+        result = await metabase_config.api_request("POST", f"dashboard/{dashboard_id}/copy", json_data=payload if payload else None)
+
+        new_id = result.get("id")
+        new_name = result.get("name")
+
+        return f"✅ Dashboard copied successfully!\n\n**Original ID:** `{dashboard_id}`\n**New ID:** `{new_id}`\n**Name:** {new_name}"
+
+    except Exception as e:
+        logger.error(f"Metabase copy dashboard error: {e}")
+        return f"Error copying dashboard: {str(e)}"
+
+
+# ============================================================================
+# Metabase Collection Management Tools
+# ============================================================================
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def metabase_create_collection(
+    name: str = Field(..., description="Name for the new collection"),
+    parent_id: Optional[int] = Field(None, description="Parent collection ID (null for root level)"),
+    description: Optional[str] = Field(None, description="Description for the collection"),
+    color: Optional[str] = Field(None, description="Color hex code for the collection (e.g., '#509EE3')")
+) -> str:
+    """Create a new collection (folder) in Metabase.
+
+    Collections organize dashboards and questions.
+    Specify parent_id to create a nested collection.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        payload = {"name": name}
+
+        if parent_id is not None:
+            payload["parent_id"] = parent_id
+        if description:
+            payload["description"] = description
+        if color:
+            payload["color"] = color
+
+        result = await metabase_config.api_request("POST", "collection", json_data=payload)
+
+        coll_id = result.get("id")
+        coll_name = result.get("name", name)
+
+        parent_info = f" (in collection `{parent_id}`)" if parent_id else " (at root level)"
+        return f"✅ Collection created successfully!\n\n**ID:** `{coll_id}`\n**Name:** {coll_name}{parent_info}"
+
+    except Exception as e:
+        logger.error(f"Metabase create collection error: {e}")
+        return f"Error creating collection: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def metabase_update_collection(
+    collection_id: int = Field(..., description="Collection ID to update"),
+    name: Optional[str] = Field(None, description="New name for the collection"),
+    description: Optional[str] = Field(None, description="New description"),
+    parent_id: Optional[int] = Field(None, description="Move to this parent collection (use 'root' for root level)"),
+    color: Optional[str] = Field(None, description="New color hex code")
+) -> str:
+    """Update an existing collection in Metabase.
+
+    Only provided fields will be updated. Use parent_id to move the collection.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        payload = {}
+
+        if name is not None:
+            payload["name"] = name
+        if description is not None:
+            payload["description"] = description
+        if parent_id is not None:
+            payload["parent_id"] = parent_id
+        if color is not None:
+            payload["color"] = color
+
+        if not payload:
+            return "No updates provided. Specify at least one field to update."
+
+        result = await metabase_config.api_request("PUT", f"collection/{collection_id}", json_data=payload)
+
+        updated_name = result.get("name", f"Collection {collection_id}")
+        return f"✅ Collection updated successfully!\n\n**ID:** `{collection_id}`\n**Name:** {updated_name}\n**Updated fields:** {', '.join(payload.keys())}"
+
+    except Exception as e:
+        logger.error(f"Metabase update collection error: {e}")
+        return f"Error updating collection: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def metabase_archive_collection(
+    collection_id: int = Field(..., description="Collection ID to archive")
+) -> str:
+    """Archive a collection in Metabase.
+
+    Archived collections and their contents are hidden but not deleted.
+    Items within the collection are also archived.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        coll = await metabase_config.api_request("GET", f"collection/{collection_id}")
+        coll_name = coll.get("name", f"Collection {collection_id}")
+
+        await metabase_config.api_request("PUT", f"collection/{collection_id}", json_data={"archived": True})
+
+        return f"✅ Collection archived successfully!\n\n**ID:** `{collection_id}`\n**Name:** {coll_name}\n\nAll items in this collection have also been archived."
+
+    except Exception as e:
+        logger.error(f"Metabase archive collection error: {e}")
+        return f"Error archiving collection: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def metabase_move_item(
+    item_id: int = Field(..., description="ID of the item to move"),
+    item_type: str = Field(..., description="Type of item: 'card' (question) or 'dashboard'"),
+    collection_id: Optional[int] = Field(None, description="Destination collection ID (null for root)")
+) -> str:
+    """Move a question or dashboard to a different collection.
+
+    Use item_type='card' for questions and 'dashboard' for dashboards.
+    Set collection_id to null to move to root collection.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    if item_type not in ["card", "dashboard"]:
+        return "Error: item_type must be 'card' or 'dashboard'"
+
+    try:
+        # Get item name
+        item = await metabase_config.api_request("GET", f"{item_type}/{item_id}")
+        item_name = item.get("name", f"{item_type} {item_id}")
+
+        # Move the item
+        payload = {"collection_id": collection_id}
+        await metabase_config.api_request("PUT", f"{item_type}/{item_id}", json_data=payload)
+
+        dest = f"collection `{collection_id}`" if collection_id else "root collection"
+        return f"✅ {item_type.title()} moved successfully!\n\n**ID:** `{item_id}`\n**Name:** {item_name}\n**Moved to:** {dest}"
+
+    except Exception as e:
+        logger.error(f"Metabase move item error: {e}")
+        return f"Error moving item: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def metabase_get_collection_items(
+    collection_id: Optional[int] = Field(None, description="Collection ID to list items from (null for root)"),
+    item_types: Optional[str] = Field(None, description="Filter by types: 'dashboard', 'card', 'collection' (comma-separated)")
+) -> str:
+    """List all items in a Metabase collection.
+
+    Returns dashboards, questions, and sub-collections within the specified collection.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        params = {}
+        if item_types:
+            params["models"] = item_types.replace(" ", "")
+
+        endpoint = f"collection/{collection_id}/items" if collection_id else "collection/root/items"
+        result = await metabase_config.api_request("GET", endpoint, params=params if params else None)
+
+        items = result.get("data", result) if isinstance(result, dict) else result
+
+        if not items:
+            coll_name = f"collection `{collection_id}`" if collection_id else "root collection"
+            return f"No items found in {coll_name}."
+
+        # Group items by type
+        collections = [i for i in items if i.get("model") == "collection"]
+        dashboards = [i for i in items if i.get("model") == "dashboard"]
+        cards = [i for i in items if i.get("model") == "card"]
+
+        coll_label = f"Collection {collection_id}" if collection_id else "Root Collection"
+        lines = [f"# Items in {coll_label}\n"]
+
+        if collections:
+            lines.append(f"## Sub-Collections ({len(collections)})")
+            for c in collections:
+                lines.append(f"- **{c.get('name')}** (ID: `{c.get('id')}`)")
+            lines.append("")
+
+        if dashboards:
+            lines.append(f"## Dashboards ({len(dashboards)})")
+            for d in dashboards:
+                lines.append(f"- **{d.get('name')}** (ID: `{d.get('id')}`)")
+            lines.append("")
+
+        if cards:
+            lines.append(f"## Questions ({len(cards)})")
+            for c in cards:
+                lines.append(f"- **{c.get('name')}** (ID: `{c.get('id')}`) - {c.get('display', 'unknown')}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Metabase get collection items error: {e}")
+        return f"Error getting collection items: {str(e)}"
+
+
+# ============================================================================
+# Metabase Permissions Management Tools
+# ============================================================================
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def metabase_list_permission_groups() -> str:
+    """List all permission groups in Metabase.
+
+    Returns group names, IDs, and member counts.
+    Use group IDs with permission management tools.
+    Requires admin privileges.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        result = await metabase_config.api_request("GET", "permissions/group")
+
+        groups = result if isinstance(result, list) else result.get("data", [])
+
+        if not groups:
+            return "No permission groups found."
+
+        lines = [f"# Metabase Permission Groups ({len(groups)} found)\n"]
+
+        for group in groups:
+            group_id = group.get("id", "N/A")
+            name = group.get("name", "Unknown")
+            member_count = group.get("member_count", 0)
+
+            lines.append(f"### {name}")
+            lines.append(f"**ID:** `{group_id}` | **Members:** {member_count}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Metabase list permission groups error: {e}")
+        return f"Error listing permission groups: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def metabase_create_permission_group(
+    name: str = Field(..., description="Name for the new permission group")
+) -> str:
+    """Create a new permission group in Metabase.
+
+    Permission groups control access to databases and collections.
+    Requires admin privileges.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        result = await metabase_config.api_request("POST", "permissions/group", json_data={"name": name})
+
+        group_id = result.get("id")
+        group_name = result.get("name", name)
+
+        return f"✅ Permission group created successfully!\n\n**ID:** `{group_id}`\n**Name:** {group_name}\n\nUse `metabase_set_database_permissions` and `metabase_set_collection_permissions` to configure access."
+
+    except Exception as e:
+        logger.error(f"Metabase create permission group error: {e}")
+        return f"Error creating permission group: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False, "destructiveHint": True})
+async def metabase_delete_permission_group(
+    group_id: int = Field(..., description="Permission group ID to delete")
+) -> str:
+    """Delete a permission group from Metabase.
+
+    WARNING: This permanently deletes the group. Users will lose any permissions granted through this group.
+    Built-in groups (Administrators, All Users) cannot be deleted.
+    Requires admin privileges.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        # Get group name before deletion
+        groups = await metabase_config.api_request("GET", "permissions/group")
+        group_name = "Unknown"
+        for g in (groups if isinstance(groups, list) else groups.get("data", [])):
+            if g.get("id") == group_id:
+                group_name = g.get("name", "Unknown")
+                break
+
+        await metabase_config.api_request("DELETE", f"permissions/group/{group_id}")
+
+        return f"✅ Permission group deleted successfully!\n\n**Deleted ID:** `{group_id}`\n**Name:** {group_name}"
+
+    except Exception as e:
+        logger.error(f"Metabase delete permission group error: {e}")
+        return f"Error deleting permission group: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def metabase_get_permissions_graph() -> str:
+    """Get the complete database permissions graph for all groups.
+
+    Shows which groups have access to which databases and at what level.
+    Requires admin privileges.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        result = await metabase_config.api_request("GET", "permissions/graph")
+
+        revision = result.get("revision", "N/A")
+        groups = result.get("groups", {})
+
+        # Get group names
+        group_list = await metabase_config.api_request("GET", "permissions/group")
+        group_names = {}
+        for g in (group_list if isinstance(group_list, list) else group_list.get("data", [])):
+            group_names[str(g.get("id"))] = g.get("name", f"Group {g.get('id')}")
+
+        # Get database names
+        db_list = await metabase_config.api_request("GET", "database")
+        db_names = {}
+        for db in (db_list if isinstance(db_list, list) else db_list.get("data", [])):
+            db_names[str(db.get("id"))] = db.get("name", f"Database {db.get('id')}")
+
+        lines = [
+            "# Metabase Database Permissions Graph",
+            f"**Revision:** {revision}",
+            ""
+        ]
+
+        for group_id, databases in groups.items():
+            group_name = group_names.get(group_id, f"Group {group_id}")
+            lines.append(f"## {group_name} (ID: {group_id})")
+
+            if not databases:
+                lines.append("_No database permissions_")
+            else:
+                for db_id, perms in databases.items():
+                    db_name = db_names.get(db_id, f"Database {db_id}")
+
+                    # Parse permission level
+                    if isinstance(perms, dict):
+                        data_perm = perms.get("data", perms.get("native", "none"))
+                        if isinstance(data_perm, dict):
+                            native = data_perm.get("native", "none")
+                            schemas = data_perm.get("schemas", "none")
+                            perm_str = f"native={native}, schemas={schemas}"
+                        else:
+                            perm_str = str(data_perm)
+                    else:
+                        perm_str = str(perms)
+
+                    lines.append(f"- **{db_name}** (ID: {db_id}): {perm_str}")
+
+            lines.append("")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Metabase get permissions graph error: {e}")
+        return f"Error getting permissions graph: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def metabase_set_database_permissions(
+    group_id: int = Field(..., description="Permission group ID"),
+    database_id: int = Field(..., description="Database ID to set permissions for"),
+    permission_level: str = Field(..., description="Permission level: 'none', 'unrestricted', 'full' (native query access), or 'limited' (no native queries)")
+) -> str:
+    """Set database access permissions for a permission group.
+
+    Permission levels:
+    - 'none': No access to the database
+    - 'limited': Can view/query via GUI but no native SQL queries
+    - 'unrestricted': Full access including native SQL queries (same as 'full')
+    - 'full': Same as unrestricted
+
+    Requires admin privileges.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    valid_levels = ["none", "unrestricted", "full", "limited"]
+    if permission_level not in valid_levels:
+        return f"Error: permission_level must be one of: {', '.join(valid_levels)}"
+
+    try:
+        # Get current permissions graph
+        graph = await metabase_config.api_request("GET", "permissions/graph")
+        revision = graph.get("revision", 0)
+        groups = graph.get("groups", {})
+
+        # Build permission value based on level
+        if permission_level == "none":
+            perm_value = {"data": {"native": "none", "schemas": "none"}}
+        elif permission_level in ["unrestricted", "full"]:
+            perm_value = {"data": {"native": "write", "schemas": "all"}}
+        else:  # limited
+            perm_value = {"data": {"native": "none", "schemas": "all"}}
+
+        # Update the specific group/database permission
+        group_key = str(group_id)
+        db_key = str(database_id)
+
+        if group_key not in groups:
+            groups[group_key] = {}
+        groups[group_key][db_key] = perm_value
+
+        # Submit updated graph
+        payload = {
+            "revision": revision,
+            "groups": groups
+        }
+
+        await metabase_config.api_request("PUT", "permissions/graph", json_data=payload)
+
+        return f"✅ Database permissions updated successfully!\n\n**Group ID:** `{group_id}`\n**Database ID:** `{database_id}`\n**Permission Level:** {permission_level}"
+
+    except Exception as e:
+        logger.error(f"Metabase set database permissions error: {e}")
+        return f"Error setting database permissions: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def metabase_get_collection_permissions() -> str:
+    """Get collection permissions for all groups.
+
+    Shows which groups have access to which collections.
+    Requires admin privileges.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        result = await metabase_config.api_request("GET", "collection/graph")
+
+        revision = result.get("revision", "N/A")
+        groups = result.get("groups", {})
+
+        # Get group names
+        group_list = await metabase_config.api_request("GET", "permissions/group")
+        group_names = {}
+        for g in (group_list if isinstance(group_list, list) else group_list.get("data", [])):
+            group_names[str(g.get("id"))] = g.get("name", f"Group {g.get('id')}")
+
+        # Get collection names
+        coll_list = await metabase_config.api_request("GET", "collection")
+        coll_names = {"root": "Root Collection"}
+        for c in (coll_list if isinstance(coll_list, list) else coll_list.get("data", [])):
+            coll_names[str(c.get("id"))] = c.get("name", f"Collection {c.get('id')}")
+
+        lines = [
+            "# Metabase Collection Permissions",
+            f"**Revision:** {revision}",
+            "",
+            "**Permission Levels:** none, read, write",
+            ""
+        ]
+
+        for group_id, collections in groups.items():
+            group_name = group_names.get(group_id, f"Group {group_id}")
+            lines.append(f"## {group_name} (ID: {group_id})")
+
+            if not collections:
+                lines.append("_No collection permissions defined_")
+            else:
+                for coll_id, perm in collections.items():
+                    coll_name = coll_names.get(coll_id, f"Collection {coll_id}")
+                    lines.append(f"- **{coll_name}** (ID: {coll_id}): {perm}")
+
+            lines.append("")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Metabase get collection permissions error: {e}")
+        return f"Error getting collection permissions: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def metabase_set_collection_permissions(
+    group_id: int = Field(..., description="Permission group ID"),
+    collection_id: str = Field(..., description="Collection ID (use 'root' for root collection)"),
+    permission_level: str = Field(..., description="Permission level: 'none', 'read', or 'write'")
+) -> str:
+    """Set collection access permissions for a permission group.
+
+    Permission levels:
+    - 'none': No access to the collection
+    - 'read': Can view items in the collection
+    - 'write': Can view, edit, and create items in the collection
+
+    Requires admin privileges.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    valid_levels = ["none", "read", "write"]
+    if permission_level not in valid_levels:
+        return f"Error: permission_level must be one of: {', '.join(valid_levels)}"
+
+    try:
+        # Get current collection permissions graph
+        graph = await metabase_config.api_request("GET", "collection/graph")
+        revision = graph.get("revision", 0)
+        groups = graph.get("groups", {})
+
+        # Update the specific group/collection permission
+        group_key = str(group_id)
+        coll_key = str(collection_id)
+
+        if group_key not in groups:
+            groups[group_key] = {}
+        groups[group_key][coll_key] = permission_level
+
+        # Submit updated graph
+        payload = {
+            "revision": revision,
+            "groups": groups
+        }
+
+        await metabase_config.api_request("PUT", "collection/graph", json_data=payload)
+
+        coll_display = "root collection" if collection_id == "root" else f"collection `{collection_id}`"
+        return f"✅ Collection permissions updated successfully!\n\n**Group ID:** `{group_id}`\n**Collection:** {coll_display}\n**Permission Level:** {permission_level}"
+
+    except Exception as e:
+        logger.error(f"Metabase set collection permissions error: {e}")
+        return f"Error setting collection permissions: {str(e)}"
+
+
+# ============================================================================
+# Metabase User Management Tools
+# ============================================================================
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def metabase_list_users(
+    include_deactivated: bool = Field(False, description="Include deactivated users")
+) -> str:
+    """List all users in Metabase.
+
+    Returns user names, emails, roles, and group memberships.
+    Requires admin privileges.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        params = {}
+        if include_deactivated:
+            params["include_deactivated"] = "true"
+
+        result = await metabase_config.api_request("GET", "user", params=params if params else None)
+
+        users = result.get("data", result) if isinstance(result, dict) else result
+
+        if not users:
+            return "No users found."
+
+        # Get group names for reference
+        groups = await metabase_config.api_request("GET", "permissions/group")
+        group_names = {}
+        for g in (groups if isinstance(groups, list) else groups.get("data", [])):
+            group_names[g.get("id")] = g.get("name", f"Group {g.get('id')}")
+
+        lines = [f"# Metabase Users ({len(users)} found)\n"]
+
+        for user in users:
+            user_id = user.get("id", "N/A")
+            email = user.get("email", "Unknown")
+            name = user.get("common_name", f"{user.get('first_name', '')} {user.get('last_name', '')}".strip() or "Unknown")
+            is_superuser = user.get("is_superuser", False)
+            is_active = user.get("is_active", True)
+            group_ids = user.get("group_ids", [])
+
+            status = "🔴 Inactive" if not is_active else ("⭐ Admin" if is_superuser else "✅ Active")
+            user_groups = [group_names.get(gid, f"Group {gid}") for gid in group_ids]
+
+            lines.append(f"### {name}")
+            lines.append(f"**ID:** `{user_id}` | **Email:** {email} | **Status:** {status}")
+            if user_groups:
+                lines.append(f"**Groups:** {', '.join(user_groups)}")
+            lines.append("")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Metabase list users error: {e}")
+        return f"Error listing users: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def metabase_create_user(
+    email: str = Field(..., description="Email address for the new user"),
+    first_name: str = Field(..., description="User's first name"),
+    last_name: str = Field(..., description="User's last name"),
+    password: Optional[str] = Field(None, description="Initial password (if not provided, user receives invite email)"),
+    group_ids: Optional[str] = Field(None, description="Comma-separated group IDs to add user to")
+) -> str:
+    """Create a new user in Metabase.
+
+    If password is provided, user can log in immediately.
+    If not, user receives an email invitation to set their password.
+    Requires admin privileges.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        payload = {
+            "email": email,
+            "first_name": first_name,
+            "last_name": last_name
+        }
+
+        if password:
+            payload["password"] = password
+
+        if group_ids:
+            try:
+                payload["group_ids"] = [int(gid.strip()) for gid in group_ids.split(",")]
+            except ValueError:
+                return "Error: group_ids must be comma-separated integers"
+
+        result = await metabase_config.api_request("POST", "user", json_data=payload)
+
+        user_id = result.get("id")
+        user_email = result.get("email", email)
+        user_name = f"{first_name} {last_name}"
+
+        invite_note = "User can log in with provided password." if password else "User will receive an invite email to set their password."
+
+        return f"✅ User created successfully!\n\n**ID:** `{user_id}`\n**Name:** {user_name}\n**Email:** {user_email}\n\n{invite_note}"
+
+    except Exception as e:
+        logger.error(f"Metabase create user error: {e}")
+        return f"Error creating user: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def metabase_update_user(
+    user_id: int = Field(..., description="User ID to update"),
+    email: Optional[str] = Field(None, description="New email address"),
+    first_name: Optional[str] = Field(None, description="New first name"),
+    last_name: Optional[str] = Field(None, description="New last name"),
+    is_superuser: Optional[bool] = Field(None, description="Set admin status (True for admin)")
+) -> str:
+    """Update an existing user in Metabase.
+
+    Only provided fields will be updated.
+    Requires admin privileges.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        payload = {}
+
+        if email is not None:
+            payload["email"] = email
+        if first_name is not None:
+            payload["first_name"] = first_name
+        if last_name is not None:
+            payload["last_name"] = last_name
+        if is_superuser is not None:
+            payload["is_superuser"] = is_superuser
+
+        if not payload:
+            return "No updates provided. Specify at least one field to update."
+
+        result = await metabase_config.api_request("PUT", f"user/{user_id}", json_data=payload)
+
+        updated_name = result.get("common_name", f"{result.get('first_name', '')} {result.get('last_name', '')}".strip())
+        return f"✅ User updated successfully!\n\n**ID:** `{user_id}`\n**Name:** {updated_name}\n**Updated fields:** {', '.join(payload.keys())}"
+
+    except Exception as e:
+        logger.error(f"Metabase update user error: {e}")
+        return f"Error updating user: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def metabase_deactivate_user(
+    user_id: int = Field(..., description="User ID to deactivate")
+) -> str:
+    """Deactivate a user in Metabase.
+
+    Deactivated users cannot log in but their data is preserved.
+    Use metabase_reactivate_user to restore access.
+    Requires admin privileges.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        # Get user info first
+        user = await metabase_config.api_request("GET", f"user/{user_id}")
+        user_name = user.get("common_name", f"User {user_id}")
+        user_email = user.get("email", "Unknown")
+
+        await metabase_config.api_request("DELETE", f"user/{user_id}")
+
+        return f"✅ User deactivated successfully!\n\n**ID:** `{user_id}`\n**Name:** {user_name}\n**Email:** {user_email}\n\nUse `metabase_reactivate_user` to restore access."
+
+    except Exception as e:
+        logger.error(f"Metabase deactivate user error: {e}")
+        return f"Error deactivating user: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def metabase_reactivate_user(
+    user_id: int = Field(..., description="User ID to reactivate")
+) -> str:
+    """Reactivate a deactivated user in Metabase.
+
+    Restores login access for a previously deactivated user.
+    Requires admin privileges.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        result = await metabase_config.api_request("PUT", f"user/{user_id}/reactivate")
+
+        user_name = result.get("common_name", f"User {user_id}")
+        user_email = result.get("email", "Unknown")
+
+        return f"✅ User reactivated successfully!\n\n**ID:** `{user_id}`\n**Name:** {user_name}\n**Email:** {user_email}"
+
+    except Exception as e:
+        logger.error(f"Metabase reactivate user error: {e}")
+        return f"Error reactivating user: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def metabase_add_user_to_group(
+    user_id: int = Field(..., description="User ID to add to group"),
+    group_id: int = Field(..., description="Permission group ID to add user to")
+) -> str:
+    """Add a user to a permission group in Metabase.
+
+    Users gain the permissions associated with the group.
+    Requires admin privileges.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        payload = {
+            "user_id": user_id,
+            "group_id": group_id
+        }
+
+        await metabase_config.api_request("POST", "permissions/membership", json_data=payload)
+
+        # Get user and group names
+        user = await metabase_config.api_request("GET", f"user/{user_id}")
+        user_name = user.get("common_name", f"User {user_id}")
+
+        groups = await metabase_config.api_request("GET", "permissions/group")
+        group_name = "Unknown"
+        for g in (groups if isinstance(groups, list) else groups.get("data", [])):
+            if g.get("id") == group_id:
+                group_name = g.get("name", f"Group {group_id}")
+                break
+
+        return f"✅ User added to group successfully!\n\n**User:** {user_name} (ID: `{user_id}`)\n**Group:** {group_name} (ID: `{group_id}`)"
+
+    except Exception as e:
+        logger.error(f"Metabase add user to group error: {e}")
+        return f"Error adding user to group: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def metabase_remove_user_from_group(
+    membership_id: int = Field(..., description="Membership ID to remove (from metabase_get_group_members)")
+) -> str:
+    """Remove a user from a permission group in Metabase.
+
+    Use metabase_get_group_members to find the membership ID.
+    Requires admin privileges.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        await metabase_config.api_request("DELETE", f"permissions/membership/{membership_id}")
+
+        return f"✅ Membership removed successfully!\n\n**Removed Membership ID:** `{membership_id}`"
+
+    except Exception as e:
+        logger.error(f"Metabase remove user from group error: {e}")
+        return f"Error removing user from group: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": True})
+async def metabase_get_group_members(
+    group_id: int = Field(..., description="Permission group ID to list members of")
+) -> str:
+    """List all members of a permission group.
+
+    Returns user names, emails, and membership IDs.
+    Use membership IDs with metabase_remove_user_from_group.
+    Requires admin privileges.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        result = await metabase_config.api_request("GET", f"permissions/group/{group_id}")
+
+        group_name = result.get("name", f"Group {group_id}")
+        members = result.get("members", [])
+
+        if not members:
+            return f"# {group_name} Members\n\nNo members in this group."
+
+        lines = [
+            f"# {group_name} Members ({len(members)} found)",
+            f"**Group ID:** `{group_id}`",
+            ""
+        ]
+
+        for member in members:
+            user_id = member.get("user_id", "N/A")
+            membership_id = member.get("membership_id", "N/A")
+            email = member.get("email", "Unknown")
+            first_name = member.get("first_name", "")
+            last_name = member.get("last_name", "")
+            name = f"{first_name} {last_name}".strip() or "Unknown"
+
+            lines.append(f"- **{name}** ({email})")
+            lines.append(f"  - User ID: `{user_id}` | Membership ID: `{membership_id}`")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        logger.error(f"Metabase get group members error: {e}")
+        return f"Error getting group members: {str(e)}"
+
+
+@mcp.tool(annotations={"readOnlyHint": False})
+async def metabase_send_password_reset(
+    user_id: int = Field(..., description="User ID to send password reset to")
+) -> str:
+    """Send a password reset email to a user.
+
+    The user will receive an email with a link to reset their password.
+    Requires admin privileges.
+    """
+    if not metabase_config.is_configured:
+        return "Error: Metabase not configured. Set METABASE_URL and METABASE_USERNAME/METABASE_PASSWORD or METABASE_API_KEY."
+
+    try:
+        # Get user email
+        user = await metabase_config.api_request("GET", f"user/{user_id}")
+        user_email = user.get("email", "Unknown")
+        user_name = user.get("common_name", f"User {user_id}")
+
+        await metabase_config.api_request("POST", f"user/{user_id}/send_invite")
+
+        return f"✅ Password reset email sent!\n\n**User:** {user_name}\n**Email:** {user_email}"
+
+    except Exception as e:
+        logger.error(f"Metabase send password reset error: {e}")
+        return f"Error sending password reset: {str(e)}"
+
+
+# ============================================================================
 # Server Status
 # ============================================================================
 
