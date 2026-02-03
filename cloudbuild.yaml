@@ -72,6 +72,20 @@ steps:
       # Integrations without configured secrets will show as "Not configured" on status page
     waitFor: ['build']
 
+  # Sync skills library to GCS bucket
+  # This makes skills available via https://storage.googleapis.com/crowdit-skills/
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    id: 'sync-skills'
+    entrypoint: bash
+    args:
+      - '-c'
+      - |
+        echo "Syncing skills library to GCS..."
+        gsutil -m rsync -r -d skills/ gs://crowdit-skills/
+        echo "Skills synced successfully"
+        echo "Skills available at: https://storage.googleapis.com/crowdit-skills/"
+    waitFor: ['deploy']
+
 images:
   - 'australia-southeast1-docker.pkg.dev/$PROJECT_ID/crowdit/crowdit-mcp-server:$BUILD_ID'
   - 'australia-southeast1-docker.pkg.dev/$PROJECT_ID/crowdit/crowdit-mcp-server:latest'
