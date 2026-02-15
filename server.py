@@ -1,6 +1,6 @@
 """
 Crowd IT Unified MCP Server
-Centralized MCP server for Cloud Run - HaloPSA, Xero, Front, SharePoint, Quoter, Pax8, BigQuery, Maxotel VoIP, Ubuntu Server (SSH), CIPP (M365), Salesforce, n8n (Workflow Automation), GCloud CLI, Azure, AWS, Dicker Data, Ingram Micro, Aussie Broadband Carbon, NinjaOne (RMM), Auvik (Network Management), and Metabase (Business Intelligence) integration.
+Centralized MCP server for Cloud Run - HaloPSA, Xero, Front, SharePoint, Quoter, Pax8, BigQuery, Maxotel VoIP, Ubuntu Server (SSH), CIPP (M365), Salesforce, n8n (Workflow Automation), GCloud CLI, Azure, AWS, Dicker Data, Ingram Micro, Aussie Broadband Carbon, NinjaOne (RMM), Auvik (Network Management), Metabase (Business Intelligence), and Jira (Project Management) integration.
 """
 
 # Absolute first thing - print to both stdout and stderr
@@ -52,12 +52,15 @@ print(f"[STARTUP] aws_tools imported at t={time.time() - _module_start_time:.3f}
 from email_tools import register_email_tools, EmailConfig
 print(f"[STARTUP] email_tools imported at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
 
+from jira_tools import register_jira_tools, JiraConfig
+print(f"[STARTUP] jira_tools imported at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
+
 # Cloud Run URL for OAuth callback
 CLOUD_RUN_URL = os.getenv("CLOUD_RUN_URL", "https://crowdit-mcp-server-lypf4vkh4q-ts.a.run.app")
 
 mcp = FastMCP(
     name="crowdit-mcp-server",
-    instructions="Crowd IT Unified MCP Server - HaloPSA, Xero, Front, SharePoint, Quoter, Pax8, BigQuery, Maxotel VoIP, Ubuntu Server (SSH), CIPP (M365), Salesforce, n8n (Workflow Automation), GCloud CLI, Azure, AWS, Dicker Data, Ingram Micro, Aussie Broadband Carbon, NinjaOne (RMM), Auvik (Network Management), and Metabase (Business Intelligence) integration for MSP operations.",
+    instructions="Crowd IT Unified MCP Server - HaloPSA, Xero, Front, SharePoint, Quoter, Pax8, BigQuery, Maxotel VoIP, Ubuntu Server (SSH), CIPP (M365), Salesforce, n8n (Workflow Automation), GCloud CLI, Azure, AWS, Dicker Data, Ingram Micro, Aussie Broadband Carbon, NinjaOne (RMM), Auvik (Network Management), Metabase (Business Intelligence), and Jira (Project Management) integration for MSP operations.",
     stateless_http=True  # Required for Cloud Run - enables stateless sessions
 )
 print(f"[STARTUP] FastMCP instance created at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
@@ -99,6 +102,19 @@ try:
 except Exception as e:
     import traceback
     print(f'[STARTUP] Email tools registration FAILED: {e}', file=sys.stderr, flush=True)
+    traceback.print_exc(file=sys.stderr)
+
+# Register Jira tools
+try:
+    jira_config = JiraConfig()
+    _jira_tool_count_before = len(mcp._tool_manager._tools)
+    register_jira_tools(mcp, jira_config)
+    _jira_tool_count_after = len(mcp._tool_manager._tools)
+    _jira_tools_added = _jira_tool_count_after - _jira_tool_count_before
+    print(f"[STARTUP] Jira tools registered ({_jira_tools_added} tools added) at t={time.time() - _module_start_time:.3f}s", file=sys.stderr, flush=True)
+except Exception as e:
+    import traceback
+    print(f'[STARTUP] Jira tools registration FAILED: {e}', file=sys.stderr, flush=True)
     traceback.print_exc(file=sys.stderr)
 
 # ============================================================================
@@ -21209,6 +21225,7 @@ if __name__ == "__main__":
         "pax8": ("Pax8Config", "pax8_config"),
         "aws": ("AWSConfig", "aws_config"),
         "email": ("EmailConfig", "email_config"),
+        "jira": ("JiraConfig", "jira_config"),
     }
 
     async def api_config_update_route(request):
