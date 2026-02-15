@@ -21179,6 +21179,132 @@ if __name__ == "__main__":
         except Exception as e:
             return JSONResponse({"error": str(e)}, status_code=500)
 
+    # ============================================================================
+    # Config Update Endpoint (for MSP Dashboard integration management)
+    # ============================================================================
+
+    # Mapping from integration ID to (config_class, config_global_name)
+    INTEGRATION_CONFIG_MAP = {
+        "halopsa": ("HaloPSAConfig", "halopsa_config"),
+        "xero": ("XeroConfig", "xero_config"),
+        "front": ("FrontConfig", "front_config"),
+        "sharepoint": ("SharePointConfig", "sharepoint_config"),
+        "bigquery": ("BigQueryConfig", "bigquery_config"),
+        "rds": ("RDSConfig", "rds_config"),
+        "forticloud": ("FortiCloudConfig", "forticloud_config"),
+        "maxotel": ("MaxotelConfig", "maxotel_config"),
+        "ubuntu": ("UbuntuConfig", "ubuntu_config"),
+        "visionrad": ("VisionRadConfig", "visionrad_config"),
+        "cipp": ("CIPPConfig", "cipp_config"),
+        "salesforce": ("SalesforceConfig", "salesforce_config"),
+        "gcloud": ("GCloudConfig", "gcloud_config"),
+        "dicker": ("DickerDataConfig", "dicker_config"),
+        "ingram": ("IngramMicroConfig", "ingram_config"),
+        "carbon": ("CarbonConfig", "carbon_config"),
+        "ninjaone": ("NinjaOneConfig", "ninjaone_config"),
+        "auvik": ("AuvikConfig", "auvik_config"),
+        "metabase": ("MetabaseConfig", "metabase_config"),
+        "gorelo": ("GoreloConfig", "gorelo_config"),
+        "n8n": ("N8NConfig", "n8n_config"),
+        "pax8": ("Pax8Config", "pax8_config"),
+        "aws": ("AWSConfig", "aws_config"),
+        "email": ("EmailConfig", "email_config"),
+    }
+
+    async def api_config_update_route(request):
+        """POST /config - Update integration configurations from MSP Dashboard.
+
+        Accepts JSON:
+        {
+            "integrations": {
+                "halopsa": {"HALOPSA_BASE_URL": "...", "HALOPSA_CLIENT_ID": "...", ...},
+                "xero": {"XERO_CLIENT_ID": "...", ...},
+                ...
+            }
+        }
+
+        Sets environment variables and reinitializes the affected config objects
+        so the MCP tools pick up the new credentials immediately.
+        """
+        from starlette.responses import JSONResponse
+
+        if request.method != "POST":
+            return JSONResponse({"error": "Method not allowed. Use POST."}, status_code=405)
+
+        try:
+            body = await request.json()
+        except Exception:
+            return JSONResponse({"error": "Invalid JSON body"}, status_code=400)
+
+        integrations = body.get("integrations")
+        if not integrations or not isinstance(integrations, dict):
+            return JSONResponse(
+                {"error": "Missing or invalid 'integrations' object in request body"},
+                status_code=400,
+            )
+
+        updated = []
+        errors = {}
+
+        for integration_id, config_values in integrations.items():
+            integration_id_lower = integration_id.lower().replace(" ", "").replace("-", "").replace("_", "")
+
+            if not isinstance(config_values, dict):
+                errors[integration_id] = "Config values must be a JSON object"
+                continue
+
+            # Find matching integration
+            matched_key = None
+            for key in INTEGRATION_CONFIG_MAP:
+                if key == integration_id_lower:
+                    matched_key = key
+                    break
+
+            if not matched_key:
+                errors[integration_id] = f"Unknown integration '{integration_id}'"
+                continue
+
+            # Set environment variables
+            env_keys_set = []
+            for key, value in config_values.items():
+                if not isinstance(key, str) or not isinstance(value, str):
+                    continue
+                os.environ[key] = value
+                env_keys_set.append(key)
+
+            # Reinitialize the config object so it picks up new env vars
+            class_name, global_name = INTEGRATION_CONFIG_MAP[matched_key]
+            try:
+                # Get the config class from the current module's globals
+                config_class = globals().get(class_name)
+                if config_class is None:
+                    errors[integration_id] = f"Config class '{class_name}' not found"
+                    continue
+
+                new_config = config_class()
+                globals()[global_name] = new_config
+
+                updated.append({
+                    "integration": integration_id,
+                    "env_keys_set": env_keys_set,
+                    "is_configured": getattr(new_config, "is_configured", None),
+                })
+
+                logger.info(f"Config updated for integration '{integration_id}': {len(env_keys_set)} env vars set")
+            except Exception as e:
+                errors[integration_id] = f"Failed to reinitialize config: {str(e)}"
+                logger.error(f"Config reinit failed for '{integration_id}': {e}", exc_info=True)
+
+        result = {
+            "success": len(errors) == 0,
+            "updated": updated,
+        }
+        if errors:
+            result["errors"] = errors
+
+        status_code = 200 if len(errors) == 0 else 207  # 207 Multi-Status if partial
+        return JSONResponse(result, status_code=status_code)
+
     # Get API key for middleware (lazy load from Secret Manager if not in env)
     api_key = os.getenv("MCP_API_KEY")  # Don't call Secret Manager at startup
     print(f"[STARTUP] API key check at t={time.time() - _module_start_time:.3f}s (from env: {api_key is not None})", file=sys.stderr, flush=True)
@@ -21213,6 +21339,7 @@ if __name__ == "__main__":
             Route("/api/refresh-token/{service_name:path}", api_refresh_token_route),
             Route("/api/test-all-connections", api_test_all_connections_route),
             Route("/api/status", api_status_json_route),
+            Route("/config", api_config_update_route, methods=["POST"]),
         ],
         lifespan=minimal_lifespan,
     )
