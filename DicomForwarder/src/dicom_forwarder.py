@@ -6,7 +6,8 @@ Receives DICOM images and forwards them to a PACS server
 import os
 import sys
 import logging
-from datetime import datetime
+from logging.handlers import RotatingFileHandler
+from datetime import datetime, timedelta
 from pathlib import Path
 import argparse
 import json
@@ -17,6 +18,7 @@ from collections import defaultdict
 
 from pynetdicom import AE, evt, StoragePresentationContexts
 from pynetdicom.sop_class import Verification
+from pynetdicom.events import Event
 from pydicom import dcmread
 from pydicom.dataset import Dataset
 
@@ -48,8 +50,23 @@ class DicomForwarder:
         self.stop_event = threading.Event()
         self.server_thread = None
         
+        # Track forwarded files for auto-delete
+        self.forwarded_files = {}  # {file_path: forward_timestamp}
+        self.forwarded_files_lock = threading.Lock()
+        self.forwarded_files_db = Path(self.config['log_dir']) / 'forwarded_files.json'
+        self.load_forwarded_files_db()
+        
     def load_config(self, config_path: str) -> dict:
         """Load configuration from JSON file or use defaults."""
+        # Normalize the config path to absolute
+        if not os.path.isabs(config_path):
+            config_path = os.path.abspath(config_path)
+        
+        # Get the base directory (where config.json is located)
+        config_dir = os.path.dirname(config_path) if config_path else os.getcwd()
+        if not config_dir:
+            config_dir = os.getcwd()
+        
         default_config = {
             'local_ae_title': 'DICOM_FORWARDER',
             'local_port': 11112,
@@ -62,22 +79,56 @@ class DicomForwarder:
             'log_dir': './logs',
             'max_pdu_size': 0,  # 0 = unlimited
             'forward_immediately': True,
-            'retry_attempts': 3
+            'retry_attempts': 3,
+            'accept_any_ae_title': False,  # Accept any Called AE Title
+            'auto_delete_days': 0,  # 0 = disabled, number of days to keep forwarded images
+            'log_max_bytes': 10 * 1024 * 1024,  # 10 MB per log file
+            'log_backup_count': 5  # Keep 5 backup log files
         }
         
+        # Log config loading attempt
+        import logging
+        logger = logging.getLogger(__name__)
+        logger.info(f"Loading config from: {config_path}")
+        logger.info(f"Config file exists: {os.path.exists(config_path)}")
+        
         if os.path.exists(config_path):
-            with open(config_path, 'r') as f:
-                loaded_config = json.load(f)
-                default_config.update(loaded_config)
-                
+            try:
+                with open(config_path, 'r') as f:
+                    loaded_config = json.load(f)
+                    logger.info(f"Successfully loaded config file. Keys: {list(loaded_config.keys())}")
+                    default_config.update(loaded_config)
+                    logger.info(f"Config values after loading:")
+                    logger.info(f"  local_ae_title: {default_config.get('local_ae_title')}")
+                    logger.info(f"  local_port: {default_config.get('local_port')}")
+                    logger.info(f"  pacs_host: {default_config.get('pacs_host')}")
+                    logger.info(f"  pacs_port: {default_config.get('pacs_port')}")
+                    logger.info(f"  pacs_ae_title: {default_config.get('pacs_ae_title')}")
+            except Exception as e:
+                logger.error(f"Error loading config file: {e}", exc_info=True)
+        else:
+            logger.warning(f"Config file not found at {config_path}, using defaults")
+        
+        # Convert relative paths to absolute paths based on config file location
+        # This ensures paths work correctly when running as a service
+        if not os.path.isabs(default_config['storage_dir']):
+            default_config['storage_dir'] = os.path.normpath(os.path.join(config_dir, default_config['storage_dir']))
+        
+        if not os.path.isabs(default_config['log_dir']):
+            default_config['log_dir'] = os.path.normpath(os.path.join(config_dir, default_config['log_dir']))
+        
         # Create directories if they don't exist
         Path(default_config['storage_dir']).mkdir(parents=True, exist_ok=True)
         Path(default_config['log_dir']).mkdir(parents=True, exist_ok=True)
         
+        logger.info(f"Final config paths:")
+        logger.info(f"  storage_dir: {default_config['storage_dir']}")
+        logger.info(f"  log_dir: {default_config['log_dir']}")
+        
         return default_config
     
     def setup_logging(self):
-        """Configure enhanced logging with detailed formatting."""
+        """Configure enhanced logging with detailed formatting and rotation."""
         log_dir = Path(self.config['log_dir'])
         log_dir.mkdir(parents=True, exist_ok=True)
         
@@ -107,13 +158,26 @@ class DicomForwarder:
             datefmt='%H:%M:%S'
         )
         
-        # File handler with detailed format
-        file_handler = logging.FileHandler(log_file, encoding='utf-8')
+        # File handler with rotation (max size and backup count from config)
+        max_bytes = self.config.get('log_max_bytes', 10 * 1024 * 1024)  # Default 10 MB
+        backup_count = self.config.get('log_backup_count', 5)  # Default 5 backups
+        
+        file_handler = RotatingFileHandler(
+            log_file, 
+            maxBytes=max_bytes, 
+            backupCount=backup_count,
+            encoding='utf-8'
+        )
         file_handler.setLevel(logging.INFO)
         file_handler.setFormatter(detailed_formatter)
         
-        # Detailed file handler for debugging
-        detailed_handler = logging.FileHandler(detailed_log_file, encoding='utf-8')
+        # Detailed file handler for debugging with rotation
+        detailed_handler = RotatingFileHandler(
+            detailed_log_file,
+            maxBytes=max_bytes,
+            backupCount=backup_count,
+            encoding='utf-8'
+        )
         detailed_handler.setLevel(logging.DEBUG)
         detailed_handler.setFormatter(detailed_formatter)
         
@@ -122,8 +186,13 @@ class DicomForwarder:
         console_handler.setLevel(logging.INFO)
         console_handler.setFormatter(console_formatter)
         
-        # Statistics handler (separate file)
-        stats_handler = logging.FileHandler(stats_log_file, encoding='utf-8')
+        # Statistics handler (separate file) with rotation
+        stats_handler = RotatingFileHandler(
+            stats_log_file,
+            maxBytes=max_bytes,
+            backupCount=backup_count,
+            encoding='utf-8'
+        )
         stats_handler.setLevel(logging.INFO)
         stats_formatter = logging.Formatter('%(asctime)s | %(message)s', datefmt='%Y-%m-%d %H:%M:%S')
         stats_handler.setFormatter(stats_formatter)
@@ -147,7 +216,81 @@ class DicomForwarder:
         self.logger.info(f"Main Log: {log_file}")
         self.logger.info(f"Detailed Log: {detailed_log_file}")
         self.logger.info(f"Statistics Log: {stats_log_file}")
+        self.logger.info(f"Log Rotation: Max {max_bytes / 1024 / 1024:.1f} MB, {backup_count} backups")
         
+    def load_forwarded_files_db(self):
+        """Load the database of forwarded files."""
+        try:
+            if self.forwarded_files_db.exists():
+                with open(self.forwarded_files_db, 'r') as f:
+                    data = json.load(f)
+                    # Convert string keys (file paths) to actual paths and timestamps
+                    self.forwarded_files = {k: float(v) for k, v in data.items()}
+                    self.logger.debug(f"Loaded {len(self.forwarded_files)} forwarded file records")
+        except Exception as e:
+            self.logger.warning(f"Error loading forwarded files database: {e}")
+            self.forwarded_files = {}
+    
+    def save_forwarded_files_db(self):
+        """Save the database of forwarded files."""
+        try:
+            with self.forwarded_files_lock:
+                data = {str(k): float(v) for k, v in self.forwarded_files.items()}
+            with open(self.forwarded_files_db, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            self.logger.warning(f"Error saving forwarded files database: {e}")
+    
+    def cleanup_old_forwarded_files(self):
+        """Delete old forwarded files that exceed the retention period."""
+        auto_delete_days = self.config.get('auto_delete_days', 0)
+        if auto_delete_days <= 0:
+            return
+        
+        cutoff_time = time.time() - (auto_delete_days * 24 * 3600)
+        deleted_count = 0
+        deleted_size = 0
+        errors = []
+        
+        self.logger.info(f"Starting cleanup: Deleting forwarded files older than {auto_delete_days} days...")
+        
+        with self.forwarded_files_lock:
+            files_to_delete = []
+            for file_path, forward_time in list(self.forwarded_files.items()):
+                if forward_time < cutoff_time:
+                    files_to_delete.append((file_path, forward_time))
+        
+        for file_path, forward_time in files_to_delete:
+            try:
+                file_path_obj = Path(file_path)
+                if file_path_obj.exists():
+                    file_size = file_path_obj.stat().st_size
+                    file_path_obj.unlink()
+                    deleted_count += 1
+                    deleted_size += file_size
+                    
+                    # Remove from tracking
+                    with self.forwarded_files_lock:
+                        self.forwarded_files.pop(file_path, None)
+                    
+                    self.logger.debug(f"Deleted old forwarded file: {file_path} (forwarded {datetime.fromtimestamp(forward_time).strftime('%Y-%m-%d %H:%M:%S')})")
+                else:
+                    # File doesn't exist, just remove from tracking
+                    with self.forwarded_files_lock:
+                        self.forwarded_files.pop(file_path, None)
+            except Exception as e:
+                errors.append(f"{file_path}: {e}")
+                self.logger.warning(f"Error deleting file {file_path}: {e}")
+        
+        if deleted_count > 0:
+            self.logger.info(f"Cleanup complete: Deleted {deleted_count} files ({deleted_size / 1024 / 1024:.2f} MB)")
+            self.save_forwarded_files_db()
+        
+        if errors:
+            self.logger.warning(f"Cleanup had {len(errors)} errors")
+        else:
+            self.logger.debug("Cleanup completed successfully with no errors")
+    
     def handle_store(self, event):
         """Handle incoming C-STORE requests with enhanced logging."""
         start_time = time.time()
@@ -226,6 +369,13 @@ class DicomForwarder:
                 self.logger.info(f"  Forward: SUCCESS ({forward_time:.3f}s)")
                 with self.stats_lock:
                     self.stats['images_forwarded'] += 1
+                
+                # Track forwarded file for auto-delete
+                if file_path and os.path.exists(file_path):
+                    with self.forwarded_files_lock:
+                        self.forwarded_files[file_path] = time.time()
+                    self.save_forwarded_files_db()
+                
                 total_time = time.time() - start_time
                 self.logger.info(f"  Total Processing Time: {total_time:.3f}s")
                 self.logger.info("="*80)
@@ -262,15 +412,13 @@ class DicomForwarder:
             self.logger.debug(f"Saved locally: {file_path} ({file_size:,} bytes)")
             return str(file_path)
         except PermissionError as e:
-            self.logger.error(f"Permission denied saving locally: {e}")
-            self.logger.error(f"  Directory: {save_dir}")
+            self.logger.error(f"Permission error saving file: {e}")
             return None
         except OSError as e:
-            self.logger.error(f"OS error saving locally: {e}")
-            self.logger.error(f"  Directory: {save_dir}")
+            self.logger.error(f"OS error saving file: {e}")
             return None
         except Exception as e:
-            self.logger.error(f"Error saving locally: {e}", exc_info=True)
+            self.logger.error(f"Unexpected error saving file: {e}", exc_info=True)
             return None
     
     def forward_to_pacs(self, ds: Dataset, file_path: Optional[str] = None) -> bool:
@@ -378,11 +526,157 @@ class DicomForwarder:
         
         # Log final statistics
         self.log_statistics()
+        
+        # Save forwarded files database
+        self.save_forwarded_files_db()
+        
         self.logger.info("="*80)
+    
+    def handle_requested(self, event):
+        """Handle association request events."""
+        requestor = getattr(event.assoc, 'requestor', None)
+        if requestor:
+            calling_ae = getattr(requestor, 'ae_title', 'UNKNOWN')
+            calling_address = getattr(requestor, 'address', 'UNKNOWN')
+        else:
+            calling_ae = 'UNKNOWN'
+            calling_address = 'UNKNOWN'
+        
+        # Get called AE title (what they're calling us)
+        called_ae = getattr(event.assoc, 'acceptor', None)
+        if called_ae:
+            called_ae_title = getattr(called_ae, 'ae_title', 'UNKNOWN')
+        else:
+            # Try to get from the association
+            if hasattr(event.assoc, 'acceptor') and hasattr(event.assoc.acceptor, 'ae_title'):
+                called_ae_title = event.assoc.acceptor.ae_title
+            else:
+                called_ae_title = 'UNKNOWN'
+        
+        # Log requested presentation contexts
+        requested_contexts = []
+        if hasattr(event.assoc, 'requestor') and hasattr(event.assoc.requestor, 'requested_contexts'):
+            for context in event.assoc.requestor.requested_contexts:
+                requested_contexts.append(f"{context.abstract_syntax} ({context.transfer_syntax})")
+        
+        self.logger.info(f"Association Request from {calling_ae} ({calling_address})")
+        self.logger.info(f"  Called AE Title: {called_ae_title}, Our AE Title: {self.config['local_ae_title']}")
+        
+        # If accept_any_ae_title is enabled, log that we'll accept it
+        if self.config.get('accept_any_ae_title', False):
+            if called_ae_title != self.config['local_ae_title']:
+                self.logger.info(f"  ✓ Will accept association with different Called AE Title (accept_any_ae_title enabled)")
+        
+        if requested_contexts:
+            self.logger.debug(f"  Requested contexts: {len(requested_contexts)}")
+            for ctx in requested_contexts[:5]:  # Log first 5
+                self.logger.debug(f"    - {ctx}")
+            if len(requested_contexts) > 5:
+                self.logger.debug(f"    ... and {len(requested_contexts) - 5} more")
+        
+        # Log our supported contexts
+        self.logger.debug(f"  Our supported contexts: {len(self.ae.supported_contexts)}")
+    
+    def handle_rejected(self, event):
+        """Handle association rejection events."""
+        try:
+            requestor = getattr(event.assoc, 'requestor', None)
+            if requestor:
+                calling_ae = getattr(requestor, 'ae_title', 'UNKNOWN')
+                calling_address = getattr(requestor, 'address', 'UNKNOWN')
+            else:
+                calling_ae = 'UNKNOWN'
+                calling_address = 'UNKNOWN'
+            
+            # Get rejection reason - try multiple ways to access it
+            rejection_reason = "Unknown reason"
+            rejection_source = "Unknown"
+            
+            # Try to get from event.assoc.acse
+            if hasattr(event, 'assoc') and hasattr(event.assoc, 'acse'):
+                acse = event.assoc.acse
+                if hasattr(acse, 'reject_reason'):
+                    rejection_reason = acse.reject_reason
+                if hasattr(acse, 'reject_source'):
+                    rejection_source = acse.reject_source
+            
+            # Try to get from event directly
+            if hasattr(event, 'reject_reason'):
+                rejection_reason = event.reject_reason
+            if hasattr(event, 'reject_source'):
+                rejection_source = event.reject_source
+            
+            # Log detailed rejection information
+            self.logger.warning("="*80)
+            self.logger.warning(f"REJECTED Association from {calling_ae} ({calling_address})")
+            self.logger.warning(f"  Rejection Source: {rejection_source}")
+            self.logger.warning(f"  Rejection Reason: {rejection_reason}")
+            self.logger.warning(f"  Our AE Title: {self.config['local_ae_title']}")
+            self.logger.warning(f"  Listening on: {self.config['local_host']}:{self.config['local_port']}")
+            self.logger.warning(f"  Accept Any AE Title: {'ENABLED' if self.config.get('accept_any_ae_title', False) else 'DISABLED'}")
+            
+            # Check if AE title mismatch (only warn if not accepting any)
+            if calling_ae != 'UNKNOWN' and calling_ae != self.config['local_ae_title']:
+                if not self.config.get('accept_any_ae_title', False):
+                    self.logger.warning(f"  ⚠️  AE Title mismatch! Caller: '{calling_ae}', Expected: '{self.config['local_ae_title']}'")
+                    self.logger.warning(f"  💡 Tip: Enable 'accept_any_ae_title' in config to accept any AE Title")
+                else:
+                    self.logger.debug(f"  AE Title mismatch (accepted due to accept_any_ae_title): '{calling_ae}' vs '{self.config['local_ae_title']}'")
+            
+            # Log requested contexts if available
+            if hasattr(event.assoc, 'requestor') and hasattr(event.assoc.requestor, 'requested_contexts'):
+                requested = event.assoc.requestor.requested_contexts
+                self.logger.debug(f"  Requested {len(requested)} presentation contexts")
+                if len(requested) == 0:
+                    self.logger.warning(f"  ⚠️  No presentation contexts requested!")
+                else:
+                    self.logger.debug(f"  First few requested contexts:")
+                    for ctx in list(requested)[:3]:
+                        self.logger.debug(f"    - {ctx}")
+            
+            # Log our supported contexts
+            self.logger.debug(f"  We support {len(self.ae.supported_contexts)} presentation contexts")
+            self.logger.warning("="*80)
+        except Exception as e:
+            self.logger.error(f"Error in handle_rejected: {e}")
+            import traceback
+            self.logger.debug(traceback.format_exc())
+    
+    def handle_accepted(self, event):
+        """Handle association accepted events."""
+        requestor = getattr(event.assoc, 'requestor', None)
+        if requestor:
+            calling_ae = getattr(requestor, 'ae_title', 'UNKNOWN')
+            calling_address = getattr(requestor, 'address', 'UNKNOWN')
+        else:
+            calling_ae = 'UNKNOWN'
+            calling_address = 'UNKNOWN'
+        
+        self.logger.info(f"ACCEPTED Association from {calling_ae} ({calling_address})")
     
     def start(self):
         """Start the DICOM SCP server with enhanced logging."""
+        # Try to register association event handlers if they exist
         handlers = [(evt.EVT_C_STORE, self.handle_store)]
+        
+        # Add association event handlers if available in pynetdicom
+        try:
+            if hasattr(evt, 'EVT_REQUESTED'):
+                handlers.append((evt.EVT_REQUESTED, self.handle_requested))
+        except:
+            pass
+        
+        try:
+            if hasattr(evt, 'EVT_REJECTED'):
+                handlers.append((evt.EVT_REJECTED, self.handle_rejected))
+        except:
+            pass
+        
+        try:
+            if hasattr(evt, 'EVT_ACCEPTED'):
+                handlers.append((evt.EVT_ACCEPTED, self.handle_accepted))
+        except:
+            pass
         
         self.logger.info("="*80)
         self.logger.info("CONFIGURATION")
@@ -391,6 +685,7 @@ class DicomForwarder:
         self.logger.info(f"    AE Title: {self.config['local_ae_title']}")
         self.logger.info(f"    Host: {self.config['local_host']}")
         self.logger.info(f"    Port: {self.config['local_port']}")
+        self.logger.info(f"    Accept Any AE Title: {'ENABLED' if self.config.get('accept_any_ae_title', False) else 'DISABLED'}")
         self.logger.info(f"  PACS Server:")
         self.logger.info(f"    Host: {self.config['pacs_host']}")
         self.logger.info(f"    Port: {self.config['pacs_port']}")
@@ -399,6 +694,11 @@ class DicomForwarder:
         self.logger.info(f"    Local Storage: {'ENABLED' if self.config['store_locally'] else 'DISABLED'}")
         if self.config['store_locally']:
             self.logger.info(f"    Storage Directory: {self.config['storage_dir']}")
+            auto_delete_days = self.config.get('auto_delete_days', 0)
+            if auto_delete_days > 0:
+                self.logger.info(f"    Auto-Delete: ENABLED (after {auto_delete_days} days)")
+            else:
+                self.logger.info(f"    Auto-Delete: DISABLED")
         self.logger.info(f"  Forwarding:")
         self.logger.info(f"    Immediate Forward: {'ENABLED' if self.config['forward_immediately'] else 'DISABLED'}")
         self.logger.info(f"    Retry Attempts: {self.config['retry_attempts']}")
@@ -425,6 +725,19 @@ class DicomForwarder:
         stats_thread = threading.Thread(target=stats_timer, daemon=True)
         stats_thread.start()
         
+        # Start auto-delete cleanup thread if enabled
+        if self.config.get('auto_delete_days', 0) > 0:
+            def cleanup_timer():
+                while not self.stop_event.is_set():
+                    # Wait 1 hour or until stopped
+                    if self.stop_event.wait(3600):
+                        break
+                    self.cleanup_old_forwarded_files()
+            
+            cleanup_thread = threading.Thread(target=cleanup_timer, daemon=True)
+            cleanup_thread.start()
+            self.logger.info(f"Auto-delete enabled: Will delete forwarded images older than {self.config['auto_delete_days']} days")
+        
         try:
             # Start server in blocking mode in a separate thread
             # This allows us to interrupt it when stop is called
@@ -442,80 +755,58 @@ class DicomForwarder:
                     )
                 except Exception as e:
                     server_error = e
-                    if not self.stop_event.is_set():
-                        self.logger.error(f"Server thread error: {e}", exc_info=True)
+                    self.logger.error(f"Server error: {e}", exc_info=True)
                 finally:
-                    if not self.stop_event.is_set():
-                        self.logger.info("Server thread exited")
+                    server_started.set()
             
             self.server_thread = threading.Thread(target=run_server, daemon=True)
             self.server_thread.start()
             
-            # Give the server a moment to start
-            time.sleep(0.5)
-            
-            # Check if server started successfully
-            if server_error:
-                raise server_error
-            
-            if self.server_thread.is_alive():
-                self.logger.info("="*80)
-                self.logger.info("DICOM SCP SERVER STARTED SUCCESSFULLY")
-                self.logger.info(f"  Listening on: {self.config['local_host']}:{self.config['local_port']}")
-                self.logger.info(f"  AE Title: {self.config['local_ae_title']}")
-                self.logger.info("  Ready to receive DICOM images...")
-                self.logger.info("="*80)
+            # Wait a moment for server to start
+            if server_started.wait(timeout=5):
+                if server_error:
+                    raise server_error
             else:
-                raise RuntimeError("Server thread exited immediately after start")
+                self.logger.warning("Server start timeout - may still be starting...")
             
-            # Wait for stop event or server thread to finish
+            self.logger.info("="*80)
+            self.logger.info("DICOM SCP SERVER STARTED SUCCESSFULLY")
+            self.logger.info(f"Listening on {self.config['local_host']}:{self.config['local_port']}")
+            self.logger.info(f"AE Title: {self.config['local_ae_title']}")
+            if self.config.get('accept_any_ae_title', False):
+                self.logger.info("Accepting associations with ANY Called AE Title")
+            self.logger.info("="*80)
+            
+            # Wait for stop event
             while not self.stop_event.is_set():
-                if not self.server_thread.is_alive():
-                    if not self.stop_event.is_set():
-                        self.logger.warning("Server thread stopped unexpectedly")
-                    break
-                time.sleep(0.5)  # Check every 500ms
-            
-            # If stop was requested, try to shutdown gracefully
-            if self.stop_event.is_set():
-                try:
-                    # Try to shutdown the AE
-                    if hasattr(self.ae, 'shutdown'):
-                        self.ae.shutdown()
-                except Exception as e:
-                    self.logger.warning(f"Error during shutdown: {e}")
+                self.stop_event.wait(1)
                 
         except KeyboardInterrupt:
-            self.logger.info("="*80)
-            self.logger.info("Shutting down DICOM forwarder (KeyboardInterrupt)...")
-            self.log_statistics()
-            self.logger.info("="*80)
-        except OSError as e:
-            self.logger.error("="*80)
-            self.logger.error(f"Server startup error: {e}")
-            if "Address already in use" in str(e) or "Only one usage of each socket address" in str(e):
-                self.logger.error(f"  Port {self.config['local_port']} is already in use!")
-                self.logger.error(f"  Check if another instance is running or change the port in config.json")
-            self.logger.error("="*80)
-            raise
+            self.logger.info("Received keyboard interrupt")
+            self.stop()
         except Exception as e:
-            self.logger.error("="*80)
-            self.logger.error(f"Server error: {e}", exc_info=True)
-            self.logger.error("="*80)
+            self.logger.error(f"Fatal error starting server: {e}", exc_info=True)
+            self.stop()
             raise
-        finally:
-            # Ensure we stop gracefully
-            if not self.stop_event.is_set():
-                self.stop()
 
 
 def main():
-    parser = argparse.ArgumentParser(description='DICOM Store-and-Forward Service')
-    parser.add_argument('--config', default='config.json', help='Path to configuration file')
+    """Main entry point for command-line execution."""
+    parser = argparse.ArgumentParser(description='DICOM Store-and-Forward Application')
+    parser.add_argument('--config', type=str, default='config.json',
+                      help='Path to configuration file (default: config.json)')
     args = parser.parse_args()
     
     forwarder = DicomForwarder(config_path=args.config)
-    forwarder.start()
+    
+    try:
+        forwarder.start()
+    except KeyboardInterrupt:
+        forwarder.stop()
+    except Exception as e:
+        forwarder.logger.error(f"Fatal error: {e}", exc_info=True)
+        forwarder.stop()
+        sys.exit(1)
 
 
 if __name__ == '__main__':

@@ -69,12 +69,44 @@ class DicomForwarderService(win32serviceutil.ServiceFramework):
             # Handle both script execution and PyInstaller executable
             if getattr(sys, 'frozen', False):
                 # Running as compiled executable
-                service_dir = os.path.dirname(sys.executable)
+                # sys.executable points to the .exe file itself
+                service_dir = os.path.dirname(os.path.abspath(sys.executable))
             else:
                 # Running as script
                 service_dir = os.path.dirname(os.path.abspath(__file__))
             
+            # Change to the service directory to ensure relative paths work
+            os.chdir(service_dir)
+            
             config_path = os.path.join(service_dir, 'config.json')
+            
+            # Verify config file exists
+            if not os.path.exists(config_path):
+                error_msg = f'Config file not found at: {config_path}'
+                logging.error(error_msg)
+                servicemanager.LogErrorMsg(error_msg)
+                # Try to create a default config
+                try:
+                    import json
+                    default_config = {
+                        'local_ae_title': 'DICOM_FORWARDER',
+                        'local_port': 11112,
+                        'local_host': '0.0.0.0',
+                        'pacs_host': '127.0.0.1',
+                        'pacs_port': 11110,
+                        'pacs_ae_title': 'PACS_SERVER',
+                        'store_locally': True,
+                        'storage_dir': os.path.join(service_dir, 'dicom_storage'),
+                        'log_dir': os.path.join(service_dir, 'logs'),
+                        'max_pdu_size': 0,
+                        'forward_immediately': True,
+                        'retry_attempts': 3
+                    }
+                    with open(config_path, 'w') as f:
+                        json.dump(default_config, f, indent=2)
+                    logging.info(f'Created default config file at: {config_path}')
+                except Exception as e:
+                    logging.error(f'Failed to create default config: {e}')
             
             # Set up basic logging to Windows Event Log first
             logging.basicConfig(
@@ -83,11 +115,46 @@ class DicomForwarderService(win32serviceutil.ServiceFramework):
                 handlers=[logging.StreamHandler()]
             )
             logger = logging.getLogger(__name__)
-            logger.info(f'Starting DICOM Forwarder Service from {service_dir}')
+            logger.info('='*80)
+            logger.info('DICOM Forwarder Service Starting')
+            logger.info('='*80)
+            logger.info(f'Service executable: {sys.executable}')
+            logger.info(f'Service directory: {service_dir}')
+            logger.info(f'Working directory: {os.getcwd()}')
             logger.info(f'Config path: {config_path}')
+            logger.info(f'Config exists: {os.path.exists(config_path)}')
+            
+            # Read and log config file contents before loading
+            if os.path.exists(config_path):
+                try:
+                    import json
+                    with open(config_path, 'r') as f:
+                        config_content = json.load(f)
+                    logger.info(f'Config file contents: {json.dumps(config_content, indent=2)}')
+                except Exception as e:
+                    logger.error(f'Error reading config file: {e}')
+            
+            logger.info('='*80)
             
             # Initialize the forwarder (this will set up proper logging)
-            self.forwarder = DicomForwarder(config_path=config_path)
+            # Pass absolute path to ensure it's found
+            abs_config_path = os.path.abspath(config_path)
+            logger.info(f'Initializing forwarder with config: {abs_config_path}')
+            self.forwarder = DicomForwarder(config_path=abs_config_path)
+            
+            # Verify the forwarder loaded the config correctly
+            logger.info('='*80)
+            logger.info('Forwarder Configuration Verification')
+            logger.info('='*80)
+            logger.info(f'  local_ae_title: {self.forwarder.config.get("local_ae_title")}')
+            logger.info(f'  local_port: {self.forwarder.config.get("local_port")}')
+            logger.info(f'  local_host: {self.forwarder.config.get("local_host")}')
+            logger.info(f'  pacs_host: {self.forwarder.config.get("pacs_host")}')
+            logger.info(f'  pacs_port: {self.forwarder.config.get("pacs_port")}')
+            logger.info(f'  pacs_ae_title: {self.forwarder.config.get("pacs_ae_title")}')
+            logger.info(f'  store_locally: {self.forwarder.config.get("store_locally")}')
+            logger.info(f'  forward_immediately: {self.forwarder.config.get("forward_immediately")}')
+            logger.info('='*80)
             
             # Start the forwarder in a separate thread so the service can respond to stop requests
             forwarder_thread = threading.Thread(target=self._run_forwarder, daemon=True)
