@@ -213,3 +213,9 @@ __marimo__/
 # OS
 .DS_Store
 Thumbs.db
+
+# Other repos (not part of this project)
+CrowdPop/
+crowdit-mcp-server/
+metabase-crowdit/
+vrg-hub-clone/
