@@ -1,4 +1,0 @@
-pyinstaller>=5.0
-pynetdicom>=2.0.2
-pydicom>=2.3.0
-pywin32>=305
