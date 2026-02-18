@@ -114,6 +114,7 @@ const DicomConverter = lazy(() => import("./pages/DicomConverter"));
 const D2dConverter = lazy(() => import("./pages/D2dConverter"));
 const D2dConverterApi = lazy(() => import("./pages/D2dConverterApi"));
 const DicomUploadPage = lazy(() => import("./pages/DicomUploadPage"));
+const PacsQueryRetrieve = lazy(() => import("./pages/PacsQueryRetrieve"));
 const CpdTracker = lazy(() => import("./pages/CpdTracker"));
 const CpdBulkAdd = lazy(() => import("./pages/CpdBulkAdd"));
 const CpdAllRecords = lazy(() => import("./pages/CpdAllRecords"));
@@ -211,6 +212,7 @@ const protectedLayoutRoutes: Array<{
   { path: "/documents-to-dicom", element: <D2dConverterApi /> },
   { path: "/d2d-iframe", element: <D2dConverter /> },
   { path: "/dicom-upload", element: <DicomUploadPage /> },
+  { path: "/pacs-query-retrieve", element: <PacsQueryRetrieve /> },
   { path: "/clinic-setup", element: <ClinicSetupChecklists />, requiredRole: ["super_admin", "tenant_admin"] },
   { path: "/clinic-setup/:id", element: <ClinicSetupDetail />, requiredRole: ["super_admin", "tenant_admin"] },
   { path: "/roster-converter", element: <RosterConverter /> },
