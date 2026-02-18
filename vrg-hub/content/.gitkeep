@@ -1,9 +1,0 @@
-# Content Directory
-
-This directory stores content managed by Decap CMS.
-
-## Structure
-
-- `pages/` - General site pages
-- `blog/` - Blog posts and articles
-- `settings/` - Site configuration
